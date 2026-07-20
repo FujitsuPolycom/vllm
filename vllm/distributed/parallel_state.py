@@ -1927,7 +1927,10 @@ def initialize_model_parallel(
     # communicator from two streams is unsupported. Same ranks as ``_DCP``.
     global _DCP_CKV_PREFETCH
     assert _DCP_CKV_PREFETCH is None, "DCP ckv prefetch group is already initialized"
-    if decode_context_model_parallel_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
+    if decode_context_model_parallel_size > 1 and (
+        envs.VLLM_B12X_MLA_CKV_GATHER
+        or envs.VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER
+    ):
         _DCP_CKV_PREFETCH = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,

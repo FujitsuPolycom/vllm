@@ -78,6 +78,30 @@ _EXTEND_PREWARM_DONE: set[
     tuple[int | None, int, int, int, int, int, bool, str, bool]
 ] = set()
 _CKV_GATHER_WORKSPACES: dict[tuple[str, int | None], torch.Tensor] = {}
+_SPARSE_DECODE_CKV_WORKSPACES: dict[tuple[str, int | None], torch.Tensor] = {}
+_SPARSE_DECODE_SELECTED_INDICES: dict[
+    tuple[str, int | None, int], torch.Tensor
+] = {}
+_SPARSE_DECODE_PATCH_SLOTS: dict[
+    tuple[str, int | None, int], torch.Tensor
+] = {}
+_SPARSE_DECODE_UNION_STATES: dict[
+    tuple[str, int | None, int, int, int, int, int, int],
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+] = {}
+_SPARSE_DECODE_P2P_FALLBACKS: dict[
+    tuple[str, int | None, str, int, int, int, int], str
+] = {}
 _KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
 
 
@@ -146,6 +170,46 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
+def _validate_sparse_decode_graph_capacity(
+    enabled: bool,
+    max_reqs: int,
+    rows_per_req: int,
+    max_cudagraph_rows: int | None,
+) -> None:
+    """Reject graph ceilings that cannot cover the configured sparse batch."""
+    graph_rows = int(max_cudagraph_rows or 0)
+    if not enabled or graph_rows == 0:
+        return
+    required_rows = int(max_reqs) * int(rows_per_req)
+    if graph_rows < required_rows:
+        raise ValueError(
+            "Sparse CKV decode requires max cudagraph capture size >= "
+            f"{required_rows} ({max_reqs} requests x {rows_per_req} rows); "
+            f"configured {graph_rows}"
+        )
+
+
+def _ckv_prefetch_supports_format(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+
+
+def _ckv_prefetch_target_indices(
+    layer_idx: int,
+    depth: int,
+    layer_caches: list[torch.Tensor | None],
+    pending_layers: dict[int, tuple[torch.cuda.Event, int]],
+) -> list[int]:
+    targets: list[int] = []
+    for distance in range(1, depth + 1):
+        target_idx = layer_idx + distance
+        if target_idx in pending_layers:
+            continue
+        if target_idx >= len(layer_caches) or layer_caches[target_idx] is None:
+            break
+        targets.append(target_idx)
+    return targets
+
+
 def _get_ckv_gather_workspace(device: torch.device, nbytes: int) -> torch.Tensor:
     key = (device.type, device.index)
     workspace = _CKV_GATHER_WORKSPACES.get(key)
@@ -158,6 +222,145 @@ def _get_ckv_gather_workspace(device: torch.device, nbytes: int) -> torch.Tensor
             f"aliases: existing={workspace.numel()} requested={nbytes}"
         )
     return workspace[:nbytes]
+
+
+def _get_sparse_decode_ckv_workspace(
+    device: torch.device, nbytes: int
+) -> torch.Tensor:
+    key = (device.type, device.index)
+    workspace = _SPARSE_DECODE_CKV_WORKSPACES.get(key)
+    if workspace is None:
+        workspace = torch.empty((nbytes,), dtype=torch.uint8, device=device)
+        _SPARSE_DECODE_CKV_WORKSPACES[key] = workspace
+    elif workspace.numel() < nbytes:
+        raise RuntimeError(
+            "Sparse decode CKV workspace cannot grow after attention layers "
+            f"retain aliases: existing={workspace.numel()} requested={nbytes}"
+        )
+    return workspace[:nbytes]
+
+
+def _get_sparse_decode_selected_indices(
+    device: torch.device, width: int
+) -> torch.Tensor:
+    key = (device.type, device.index, int(width))
+    indices = _SPARSE_DECODE_SELECTED_INDICES.get(key)
+    if indices is None:
+        indices = torch.arange(width, dtype=torch.int32, device=device).view(1, width)
+        _SPARSE_DECODE_SELECTED_INDICES[key] = indices
+    return indices
+
+
+def _get_sparse_decode_patch_slots(
+    device: torch.device, rows: int
+) -> torch.Tensor:
+    key = (device.type, device.index, int(rows))
+    slots = _SPARSE_DECODE_PATCH_SLOTS.get(key)
+    if slots is None:
+        slots = torch.empty((rows,), dtype=torch.int64, device=device)
+        _SPARSE_DECODE_PATCH_SLOTS[key] = slots
+    return slots
+
+
+def _get_sparse_decode_union_state(
+    device: torch.device,
+    rows_per_req: int,
+    topk: int,
+    union_world_size: int,
+    destination_count: int,
+    dcp_world_size: int,
+    max_reqs: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    key = (
+        device.type,
+        device.index,
+        int(rows_per_req),
+        int(topk),
+        int(union_world_size),
+        int(destination_count),
+        int(dcp_world_size),
+        int(max_reqs),
+    )
+    state = _SPARSE_DECODE_UNION_STATES.get(key)
+    if state is None:
+        all_rank_rows_per_req = union_world_size * rows_per_req
+        per_req_capacity = all_rank_rows_per_req * topk
+        hash_capacity = 1 << (2 * per_req_capacity - 1).bit_length()
+        max_rows = max_reqs * rows_per_req
+        union_indices = torch.empty(
+            (destination_count, max_reqs, per_req_capacity),
+            dtype=torch.int32,
+            device=device,
+        )
+        remap = torch.empty((max_rows, topk), dtype=torch.int32, device=device)
+        all_rank_topk = torch.empty(
+            (dcp_world_size * max_rows, topk), dtype=torch.int32, device=device
+        )
+        all_rank_topk_by_req = torch.empty(
+            (max_reqs, dcp_world_size, rows_per_req, topk),
+            dtype=torch.int32,
+            device=device,
+        )
+        all_rank_remap = torch.empty(
+            (max_reqs, destination_count, all_rank_rows_per_req, topk),
+            dtype=torch.int32,
+            device=device,
+        )
+        union_count = torch.empty(
+            (destination_count, max_reqs), dtype=torch.int32, device=device
+        )
+        hash_keys = torch.empty(
+            (destination_count, max_reqs, hash_capacity),
+            dtype=torch.int32,
+            device=device,
+        )
+        hash_values = torch.empty_like(hash_keys)
+        local_slots = torch.empty(
+            (destination_count, max_reqs, per_req_capacity),
+            dtype=torch.int32,
+            device=device,
+        )
+        state = (
+            union_indices,
+            remap,
+            union_count,
+            hash_keys,
+            hash_values,
+            local_slots,
+            all_rank_topk,
+            all_rank_topk_by_req,
+            all_rank_remap,
+        )
+        _SPARSE_DECODE_UNION_STATES[key] = state
+    return state
+
+
+def _sparse_decode_prefetch_targets(
+    layer_idx: int,
+    prefetch_depth: int,
+    emits_topk_by_layer: list[bool | None],
+) -> list[int]:
+    """Return consecutive Shared layers following a Full/indexer layer."""
+    targets: list[int] = []
+    for distance in range(1, prefetch_depth + 1):
+        target_idx = layer_idx + distance
+        if target_idx >= len(emits_topk_by_layer):
+            break
+        emits_topk = emits_topk_by_layer[target_idx]
+        if emits_topk is None or emits_topk:
+            break
+        targets.append(target_idx)
+    return targets
 
 
 def _dcp_all_gather_current_stream(
@@ -193,6 +396,185 @@ def _dcp_all_gather_current_stream(
 
     gathered = group.all_gather(input_tensor, dim=0)
     output_tensor.copy_(gathered)
+
+
+def _dcp_all_reduce_current_stream(group, tensor: torch.Tensor) -> None:
+    if not tensor.is_contiguous():
+        raise ValueError("Sparse decode CKV all-reduce tensor must be contiguous")
+
+    communicator = getattr(group, "device_communicator", None)
+    pynccl_comm = getattr(communicator, "pynccl_comm", None)
+    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", False):
+        pynccl_comm.all_reduce(tensor, out_tensor=tensor)
+        return
+
+    device_group = getattr(group, "device_group", None)
+    if device_group is None:
+        device_group = getattr(communicator, "device_group", None)
+    if device_group is not None:
+        dist.all_reduce(tensor, group=device_group, async_op=False)
+        return
+
+    reduced = group.all_reduce(tensor)
+    tensor.copy_(reduced)
+
+
+@triton.jit
+def _pack_sparse_decode_ckv_local_kernel(
+    kv_cache_ptr,
+    local_slots_ptr,
+    packed_ptr,
+    slots_stride0,
+    slots_stride1,
+    packed_stride0,
+    packed_stride1,
+    packed_stride2,
+    RECORD_BYTES: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    selected = tl.program_id(1)
+    byte = tl.arange(0, BLOCK_BYTES)
+    local_slot = tl.load(
+        local_slots_ptr + row * slots_stride0 + selected * slots_stride1
+    )
+    valid = local_slot >= 0
+    value = tl.load(
+        kv_cache_ptr + local_slot * RECORD_BYTES + byte,
+        mask=valid & (byte < RECORD_BYTES),
+        other=0,
+    )
+    tl.store(
+        packed_ptr
+        + row * packed_stride0
+        + selected * packed_stride1
+        + byte * packed_stride2,
+        value,
+        mask=byte < RECORD_BYTES,
+    )
+
+
+def _pack_sparse_decode_ckv_local(
+    kv_cache: torch.Tensor,
+    local_slots: torch.Tensor,
+    packed: torch.Tensor,
+) -> None:
+    """Pack rank-owned native CKV records without changing top-k order."""
+    if kv_cache.dtype != torch.uint8 or packed.dtype != torch.uint8:
+        raise TypeError("Sparse decode CKV pack requires uint8 record storage")
+    if local_slots.dtype != torch.int32:
+        raise TypeError("Sparse decode CKV local slots must be int32")
+    if local_slots.ndim != 2 or packed.ndim != 3:
+        raise ValueError(
+            "Sparse decode CKV pack expects rank-2 slots and rank-3 output"
+        )
+    if tuple(packed.shape[:2]) != tuple(local_slots.shape):
+        raise ValueError("Sparse decode CKV slots/output shapes do not match")
+    if not kv_cache.is_contiguous() or not packed.is_contiguous():
+        raise ValueError("Sparse decode CKV pack tensors must be contiguous")
+    record_bytes = int(packed.shape[2])
+    if int(kv_cache.shape[-1]) != record_bytes:
+        raise ValueError("Sparse decode CKV record widths do not match")
+    block_bytes = triton.next_power_of_2(record_bytes)
+    _pack_sparse_decode_ckv_local_kernel[
+        (local_slots.shape[0], local_slots.shape[1])
+    ](
+        kv_cache,
+        local_slots,
+        packed,
+        local_slots.stride(0),
+        local_slots.stride(1),
+        packed.stride(0),
+        packed.stride(1),
+        packed.stride(2),
+        RECORD_BYTES=record_bytes,
+        BLOCK_BYTES=block_bytes,
+    )
+
+
+@triton.jit
+def _find_sparse_decode_current_token_slot_kernel(
+    topk_indices_ptr,
+    req_id_ptr,
+    global_seq_len_ptr,
+    output_slot_ptr,
+    topk_stride0,
+    TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_N)
+    req = tl.load(req_id_ptr + row)
+    selected = tl.load(
+        topk_indices_ptr + req * topk_stride0 + offsets,
+        mask=offsets < TOPK,
+        other=-1,
+    )
+    global_seq_len = tl.load(global_seq_len_ptr + row)
+    current_token = global_seq_len - 1
+    matched = tl.max(tl.where(selected == current_token, offsets, -1), axis=0)
+    flattened_slot = tl.where(matched >= 0, req * TOPK + matched, -1)
+    tl.store(output_slot_ptr + row, flattened_slot)
+
+
+def _find_sparse_decode_current_token_slot(
+    topk_indices: torch.Tensor,
+    req_id_per_token: torch.Tensor,
+    global_seq_len: torch.Tensor,
+    output_slot: torch.Tensor,
+) -> None:
+    if topk_indices.ndim != 2:
+        raise ValueError("Sparse decode current-token patch expects request rows")
+    if topk_indices.dtype != torch.int32:
+        raise TypeError("Sparse decode current-token top-k must be int32")
+    if req_id_per_token.ndim != 1:
+        raise TypeError("Sparse decode current-token request ids must be rank 1")
+    if global_seq_len.ndim != 1 or global_seq_len.dtype != torch.int32:
+        raise TypeError("Sparse decode current-token lengths must be int32")
+    if req_id_per_token.shape != global_seq_len.shape:
+        raise TypeError("Sparse decode request ids must match the lengths")
+    if output_slot.shape != global_seq_len.shape or output_slot.dtype != torch.int64:
+        raise TypeError("Sparse decode current-token slots must match the lengths")
+    topk = int(topk_indices.shape[1])
+    _find_sparse_decode_current_token_slot_kernel[(global_seq_len.numel(),)](
+        topk_indices,
+        req_id_per_token,
+        global_seq_len,
+        output_slot,
+        topk_indices.stride(0),
+        TOPK=topk,
+        BLOCK_N=triton.next_power_of_2(topk),
+    )
+
+
+@triton.jit
+def _offset_sparse_decode_remap_kernel(
+    remap_ptr,
+    numel,
+    offset,
+    BLOCK_SIZE: tl.constexpr,
+):
+    positions = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = positions < numel
+    values = tl.load(remap_ptr + positions, mask=mask, other=-1)
+    values = tl.where(values >= 0, values + offset, values)
+    tl.store(remap_ptr + positions, values, mask=mask)
+
+
+def _offset_sparse_decode_remap(remap: torch.Tensor, offset: int) -> None:
+    """Move one request's valid remap slots into its pooled segment."""
+    if remap.dtype != torch.int32 or not remap.is_contiguous():
+        raise TypeError("Sparse decode remap must be contiguous int32")
+    numel = int(remap.numel())
+    if numel == 0 or offset == 0:
+        return
+    block_size = 256
+    _offset_sparse_decode_remap_kernel[(_cdiv(numel, block_size),)](
+        remap,
+        numel,
+        int(offset),
+        BLOCK_SIZE=block_size,
+    )
 
 
 @triton.jit
@@ -571,6 +953,13 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         from vllm import envs as envs_mod
 
         ckv_gather_requested = envs_mod.VLLM_B12X_MLA_CKV_GATHER
+        sparse_decode_ckv_requested = (
+            envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER
+        )
+        ckv_metadata_requested = (
+            ckv_gather_requested or sparse_decode_ckv_requested
+        )
+        self.ckv_metadata_requested = ckv_metadata_requested
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
         self.cache_seq_lens_per_token_buffer = torch.empty(
@@ -674,14 +1063,21 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         if envs_mod.VLLM_B12X_MLA_CKV_GATHER:
             # Reset the cross-layer prefetch pipeline once per step so the
-            # first layer always sync-gathers. The event/buf-idx are class
-            # state that would otherwise leak across chunks (the last layer
-            # of a chunk consumes but never re-arms), mis-scheduling layer 0
-            # of subsequent chunks onto a stale gathered buffer. The
-            # layer->cache registry is intentionally left intact (stable
-            # cache pointers across chunks).
-            B12xMLASparseImpl._shared_gather_event = None
-            B12xMLASparseImpl._shared_gather_buf_idx = 0
+            # first layer always sync-gathers. Pending target-layer events are
+            # class state that must not leak across scheduler steps. Cache
+            # pointers remain registered because their addresses are stable.
+            pending_events = getattr(
+                B12xMLASparseImpl, "_shared_gather_events", {}
+            )
+            if pending_events:
+                logger.warning_once(
+                    "Draining %d unconsumed CKV prefetch event(s) before "
+                    "reusing the workspace ring.",
+                    len(pending_events),
+                )
+                for event, _ in pending_events.values():
+                    event.synchronize()
+            B12xMLASparseImpl._shared_gather_events = {}
 
         if (
             use_dcp
@@ -886,7 +1282,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             dcp_local_cu_seq_lens=dcp_local_cu_seq_lens,
             global_cache_seq_lens_per_req=(
                 cm.seq_lens[: cm.num_reqs]
-                if use_dcp and envs_mod.VLLM_B12X_MLA_CKV_GATHER
+                if use_dcp and self.ckv_metadata_requested
                 else None
             ),
             dcp_local_total_tokens=dcp_local_total_tokens,
@@ -986,6 +1382,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.topk_indices_buffer: torch.Tensor | None = (
             indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
+        self._sparse_decode_emits_topk = indexer is not None
         assert self.topk_indices_buffer is not None, (
             "B12X_MLA_SPARSE requires sparse-MLA top-k indices "
             "(model with index_topk in its config)."
@@ -1070,6 +1467,14 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         spec = getattr(vllm_config, "speculative_config", None)
         if spec is not None and getattr(spec, "num_speculative_tokens", None):
             q_per_req = 1 + int(spec.num_speculative_tokens)
+        self._sparse_decode_rows_per_req = q_per_req
+        self._sparse_decode_max_reqs = min(
+            max_num_seqs,
+            _env_int("VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS", 2),
+        )
+        self._sparse_decode_max_rows = (
+            self._sparse_decode_max_reqs * self._sparse_decode_rows_per_req
+        )
         if self.spec_extend_as_decode:
             q_per_req = max(q_per_req, self.spec_decode_max_q)
         self._decode_max_rows = min(max_num_seqs * q_per_req, max_batched)
@@ -1146,11 +1551,70 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._extend_plan = _make_plan(
             "extend", max_batched, self._kernel_num_heads, max_num_seqs
         )
+        from vllm import envs as envs_mod
+
+        sparse_decode_ckv_requested = (
+            envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER
+        )
+        self._sparse_decode_ckv_enabled = sparse_decode_ckv_requested and (
+            self.dcp_world_size > 1
+            and self.num_heads % _HEAD_ALIGNMENT == 0
+            and self.topk_tokens % self.block_size == 0
+            and self.kv_cache_dtype == "nvfp4_ds_mla"
+            and self._kv_record_bytes == 432
+            and not self._kv_fp8_rope
+        )
+        if sparse_decode_ckv_requested and not self._sparse_decode_ckv_enabled:
+            logger.warning_once(
+                "Ignoring VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER for "
+                "unsupported topology/format: dcp=%d local_heads=%d topk=%d "
+                "block=%d dtype=%s record_bytes=%d KV_FP8_ROPE=%d",
+                self.dcp_world_size,
+                self.num_heads,
+                self.topk_tokens,
+                self.block_size,
+                self.kv_cache_dtype,
+                self._kv_record_bytes,
+                int(self._kv_fp8_rope),
+            )
+        _validate_sparse_decode_graph_capacity(
+            self._sparse_decode_ckv_enabled,
+            self._sparse_decode_max_reqs,
+            self._sparse_decode_rows_per_req,
+            vllm_config.compilation_config.max_cudagraph_capture_size,
+        )
+        self._sparse_decode_plan = (
+            _make_plan(
+                "decode",
+                self._sparse_decode_rows_per_req,
+                self.num_heads,
+                self._sparse_decode_rows_per_req,
+            )
+            if self._sparse_decode_ckv_enabled
+            else None
+        )
+        self._sparse_decode_batch_plan = (
+            _make_plan(
+                "decode",
+                self._sparse_decode_max_rows,
+                self.num_heads,
+                self._sparse_decode_max_rows,
+            )
+            if self._sparse_decode_ckv_enabled
+            and self._sparse_decode_max_reqs > 1
+            else self._sparse_decode_plan
+        )
         # One caller-owned uint8 scratch tensor covers either path (the larger
         # layout); the per-mode materializer carves its views from the prefix.
         self._scratch_nbytes = max(
             int(self._decode_plan.layout.nbytes),
             int(self._extend_plan.layout.nbytes),
+            int(self._sparse_decode_plan.layout.nbytes)
+            if self._sparse_decode_plan is not None
+            else 0,
+            int(self._sparse_decode_batch_plan.layout.nbytes)
+            if self._sparse_decode_batch_plan is not None
+            else 0,
         )
 
         # Pre-touch q-concat + the attention scratch TOGETHER so the workspace
@@ -1178,8 +1642,6 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._prewarm_extend_kernels_once(max_batched)
 
         # CKV gather setup (Fix B).
-        from vllm import envs as envs_mod
-
         ckv_gather_requested = envs_mod.VLLM_B12X_MLA_CKV_GATHER
         self._ckv_gather_enabled = ckv_gather_requested and (
             self.dcp_world_size > 1
@@ -1197,6 +1659,16 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._ckv_kernel_num_heads = self.num_heads
         self._ckv_gather_max_tokens = envs_mod.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS
         self._ckv_gather_min_tokens = envs_mod.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS
+        self._ckv_prefetch_supported = (
+            self._ckv_gather_enabled
+            and _ckv_prefetch_supports_format(self.kv_cache_dtype)
+        )
+        self._ckv_prefetch_depth = (
+            max(1, int(envs_mod.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH))
+            if self._ckv_prefetch_supported
+            else 1
+        )
+        self._ckv_workspace_slots = self._ckv_prefetch_depth + 1
         self._ckv_local_capacity = (
             _cdiv(
                 _cdiv(self._ckv_gather_max_tokens, max(1, self.dcp_world_size))
@@ -1206,8 +1678,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             * self.block_size
         )
         self._ckv_workspace_nbytes = (
-            2
-            * (self.dcp_world_size + 1)
+            (1 + self._ckv_workspace_slots * self.dcp_world_size)
             * self._ckv_local_capacity
             * self._kv_record_bytes
             if self._ckv_gather_enabled
@@ -1218,10 +1689,205 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             if self._ckv_gather_enabled
             else None
         )
+        if self._sparse_decode_ckv_enabled and not self._ckv_gather_enabled:
+            raise RuntimeError(
+                "Sparse decode CKV gather currently requires full CKV gather "
+                "to provision the shared side-stream/event infrastructure"
+            )
+
+        # Sparse decode gathers only selected records. The NCCL fallback builds
+        # one global union; direct scatter builds one destination-specific union
+        # while retaining only the local destination's sparse workspace.
+        configured_prefetch_depth = int(
+            envs_mod.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH
+        )
+        requested_sparse_transport = (
+            envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_CKV_TRANSPORT
+        )
+        if requested_sparse_transport not in (
+            "nccl",
+            "p2p",
+            "p2p_scatter",
+            "p2p_ce_scatter",
+        ):
+            logger.warning_once(
+                "Unknown sparse CKV transport %r; falling back to NCCL",
+                requested_sparse_transport,
+            )
+            requested_sparse_transport = "nccl"
+        self._sparse_decode_destination_scatter = bool(
+            requested_sparse_transport in ("p2p_scatter", "p2p_ce_scatter")
+        )
+        self._sparse_decode_union_world_size = (
+            1 if self._sparse_decode_destination_scatter else self.dcp_world_size
+        )
+        self._sparse_decode_destination_count = (
+            self.dcp_world_size if self._sparse_decode_destination_scatter else 1
+        )
+        self._sparse_decode_per_req_capacity = (
+            _cdiv(
+                self.topk_tokens
+                * self._sparse_decode_rows_per_req
+                * self._sparse_decode_union_world_size,
+                self.block_size,
+            )
+            * self.block_size
+        )
+        self._sparse_decode_padded_topk = (
+            self._sparse_decode_max_reqs * self._sparse_decode_per_req_capacity
+        )
+        self._sparse_decode_prefetch_depth = (
+            max(0, configured_prefetch_depth)
+            if self._sparse_decode_ckv_enabled
+            else 0
+        )
+        self._sparse_decode_workspace_slots = max(
+            1, self._sparse_decode_prefetch_depth + 1
+        )
+        self._sparse_decode_workspace_nbytes = (
+            self._sparse_decode_workspace_slots
+            * self._sparse_decode_padded_topk
+            * self._kv_record_bytes
+            if self._sparse_decode_ckv_enabled
+            else 0
+        )
+
+        self._sparse_decode_ckv_transport = requested_sparse_transport
+        self._sparse_decode_p2p = None
+        sparse_p2p_primary_capacity = _env_int(
+            "VLLM_B12X_MLA_SPARSE_DECODE_CKV_PRIMARY_CAPACITY",
+            max(
+                1,
+                _cdiv(
+                    self._sparse_decode_padded_topk,
+                    self.dcp_world_size,
+                ),
+            ),
+        )
+        sparse_p2p_key = (
+            self.device.type,
+            self.device.index,
+            requested_sparse_transport,
+            self._sparse_decode_workspace_slots,
+            self._sparse_decode_padded_topk,
+            self._kv_record_bytes,
+            sparse_p2p_primary_capacity,
+        )
+        cached_p2p_fallback = _SPARSE_DECODE_P2P_FALLBACKS.get(sparse_p2p_key)
+        if self._sparse_decode_ckv_enabled and cached_p2p_fallback == "stock":
+            self._sparse_decode_ckv_enabled = False
+            self._sparse_decode_ckv_transport = "stock"
+        elif self._sparse_decode_ckv_enabled and cached_p2p_fallback == "nccl":
+            self._sparse_decode_ckv_transport = "nccl"
+        elif self._sparse_decode_ckv_enabled and requested_sparse_transport in (
+            "p2p",
+            "p2p_scatter",
+            "p2p_ce_scatter",
+        ):
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_dcp_ckv_prefetch_group,
+                )
+                from vllm.v1.attention.backends.mla.b12x_sparse_ckv_p2p import (
+                    get_b12x_sparse_ckv_p2p,
+                )
+
+                p2p_group = get_dcp_ckv_prefetch_group().device_group
+                if p2p_group is None:
+                    raise RuntimeError("DCP CKV P2P group has no device group")
+                self._sparse_decode_p2p = get_b12x_sparse_ckv_p2p(
+                    process_group=p2p_group,
+                    device=self.device,
+                    workspace_slots=self._sparse_decode_workspace_slots,
+                    topk=self._sparse_decode_padded_topk,
+                    record_bytes=self._kv_record_bytes,
+                    primary_capacity=sparse_p2p_primary_capacity,
+                    allocate_direct_workspace=(
+                        requested_sparse_transport != "p2p_ce_scatter"
+                    ),
+                )
+                logger.info_once(
+                    "Using B12X CUDA-IPC P2P sparse decode CKV transport=%s "
+                    "(DCP%d, %d bytes/record, union_capacity=%d)",
+                    requested_sparse_transport,
+                    self.dcp_world_size,
+                    self._kv_record_bytes,
+                    self._sparse_decode_padded_topk,
+                )
+            except Exception as exc:
+                if self._sparse_decode_destination_scatter:
+                    logger.warning_once(
+                        "Destination-specific sparse CKV P2P initialization "
+                        "failed (%s); disabling the sparse decode fast path "
+                        "and falling back to stock DCP decode",
+                        exc,
+                    )
+                    _SPARSE_DECODE_P2P_FALLBACKS[sparse_p2p_key] = "stock"
+                    self._sparse_decode_ckv_enabled = False
+                    self._sparse_decode_ckv_transport = "stock"
+                else:
+                    logger.warning_once(
+                        "Sparse CKV P2P initialization failed (%s); falling "
+                        "back to NCCL",
+                        exc,
+                    )
+                    _SPARSE_DECODE_P2P_FALLBACKS[sparse_p2p_key] = "nccl"
+                    self._sparse_decode_ckv_transport = "nccl"
+
+        # Resolve P2P availability before allocating sparse-only state. A
+        # destination-scatter failure falls back to stock DCP decode, so these
+        # buffers would otherwise consume KV headroom without ever being read.
+        self._sparse_decode_workspace = (
+            _get_sparse_decode_ckv_workspace(
+                self.device, self._sparse_decode_workspace_nbytes
+            )
+            if self._sparse_decode_ckv_enabled
+            else None
+        )
+        sparse_union_state = (
+            _get_sparse_decode_union_state(
+                self.device,
+                self._sparse_decode_rows_per_req,
+                self.topk_tokens,
+                self._sparse_decode_union_world_size,
+                self._sparse_decode_destination_count,
+                self.dcp_world_size,
+                self._sparse_decode_max_reqs,
+            )
+            if self._sparse_decode_ckv_enabled
+            else (None, None, None, None, None, None, None, None, None)
+        )
+        (
+            self._sparse_decode_union_indices,
+            self._sparse_decode_selected_indices,
+            self._sparse_decode_union_count,
+            self._sparse_decode_hash_keys,
+            self._sparse_decode_hash_values,
+            self._sparse_decode_local_slots,
+            self._sparse_decode_all_rank_topk,
+            self._sparse_decode_all_rank_topk_by_req,
+            self._sparse_decode_all_rank_remap,
+        ) = sparse_union_state
+        self._sparse_decode_req_ids = (
+            torch.arange(
+                self._sparse_decode_max_reqs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if self._sparse_decode_ckv_enabled
+            else None
+        )
+        self._sparse_decode_patch_slot = (
+            _get_sparse_decode_patch_slots(
+                self.device, self._sparse_decode_max_rows
+            )
+            if self._sparse_decode_ckv_enabled
+            else None
+        )
 
         # Separate extend plan for the gathered-cache path: full local heads
         # (no head all-gather), global seq lens.
-        if self._ckv_gather_enabled:
+        if self._ckv_gather_enabled or self._sparse_decode_ckv_enabled:
             self._ckv_extend_plan = _make_plan(
                 "extend", max_batched, self._ckv_kernel_num_heads, max_num_seqs
             )
@@ -1232,25 +1898,46 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         else:
             self._ckv_extend_plan = None
 
-        # Layer prefetch (side stream + events + ping-pong).
-        # _shared_* are class-level: layer L kicks off the prefetch for
-        # layer L+1, and layer L+1 (a different impl instance) consumes it.
-        self._ckv_prefetch_supported = self._ckv_gather_enabled and (
-            self.kv_cache_dtype == "fp8_ds_mla" or self._kv_fp8_rope
-        )
+        # Layer prefetch uses a side stream and a bounded ring shared across
+        # the per-layer implementation instances.
         if self._ckv_gather_enabled:
-            self._ckv_gather_stream = torch.cuda.Stream(device=self.device)
+            shared_stream = getattr(
+                B12xMLASparseImpl, "_shared_gather_stream", None
+            )
+            if shared_stream is None:
+                shared_stream = torch.cuda.Stream(device=self.device)
+                B12xMLASparseImpl._shared_gather_stream = shared_stream
+            self._ckv_gather_stream = shared_stream
             self._ckv_current_chunk_kv_c: torch.Tensor | None = None
             self._ckv_current_chunk_kpe: torch.Tensor | None = None
             B12xMLASparseImpl._all_layer_kv_caches: list[torch.Tensor | None] = []
-            B12xMLASparseImpl._shared_gather_event: torch.cuda.Event | None = None
-            B12xMLASparseImpl._shared_gather_buf_idx = 0
+            B12xMLASparseImpl._all_layer_sparse_impls: list[
+                B12xMLASparseImpl | None
+            ] = []
+            B12xMLASparseImpl._shared_gather_events: dict[
+                int, tuple[torch.cuda.Event, int]
+            ] = {}
+            B12xMLASparseImpl._sparse_decode_gather_events: dict[
+                int, tuple[torch.cuda.Event | None, int]
+            ] = {}
             if not self._ckv_prefetch_supported:
                 logger.warning_once(
                     "CKV gather prefetch disabled for kv_cache_dtype=%s "
                     "(KV_FP8_ROPE=%s); falling back to synchronous gather.",
                     self.kv_cache_dtype,
                     int(self._kv_fp8_rope),
+                )
+            else:
+                logger.info_once(
+                    "Using native CKV layer prefetch with depth=%d and "
+                    "%d workspace slots.",
+                    self._ckv_prefetch_depth,
+                    self._ckv_workspace_slots,
+                )
+            if self._sparse_decode_prefetch_depth > 0:
+                logger.info_once(
+                    "Using depth-%d selected-record CKV decode prefetch",
+                    self._sparse_decode_prefetch_depth,
                 )
         else:
             self._ckv_gather_stream = None
@@ -1589,6 +2276,27 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         ):
             raise RuntimeError("B12X CKV gather borrowed an invalid workspace")
 
+    def _ckv_workspace_views(
+        self, ckv_workspace: torch.Tensor, buf_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_ckv_workspace(ckv_workspace)
+        if not 0 <= int(buf_idx) < self._ckv_workspace_slots:
+            raise ValueError(
+                f"CKV gather buffer index {buf_idx} is outside "
+                f"[0, {self._ckv_workspace_slots})"
+            )
+        records = ckv_workspace.view(-1, self._kv_record_bytes)
+        local_buffer = records[: self._ckv_local_capacity]
+        gathered_base = (
+            self._ckv_local_capacity
+            + buf_idx * self.dcp_world_size * self._ckv_local_capacity
+        )
+        gathered_buffer = records[
+            gathered_base : gathered_base
+            + self.dcp_world_size * self._ckv_local_capacity
+        ]
+        return local_buffer, gathered_buffer
+
     def dcp_prefill_ckv_gather_eligible(
         self,
         attn_metadata: B12xMLASparseMetadata,
@@ -1621,6 +2329,315 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             )
         )
 
+    def dcp_sparse_decode_ckv_gather_eligible(
+        self,
+        attn_metadata: B12xMLASparseMetadata,
+        num_tokens: int,
+    ) -> bool:
+        """Gate sparse decode to a bounded batch with uniform MTP row counts."""
+        num_reqs = int(attn_metadata.num_reqs)
+        rows = int(num_tokens)
+        if (
+            self._sparse_decode_ckv_enabled
+            and self.dcp_world_size > 1
+            and num_reqs > self._sparse_decode_max_reqs
+        ):
+            logger.info_once(
+                "Sparse selected-record CKV decode falling back to stock DCP "
+                "decode: active requests=%d exceeds configured maximum=%d",
+                num_reqs,
+                self._sparse_decode_max_reqs,
+            )
+        return bool(
+            self._sparse_decode_ckv_enabled
+            and self.dcp_world_size > 1
+            and 1 <= num_reqs <= self._sparse_decode_max_reqs
+            and 1 <= rows <= self._sparse_decode_max_rows
+            and rows % num_reqs == 0
+            and rows // num_reqs <= self._sparse_decode_rows_per_req
+            and attn_metadata.num_actual_tokens == rows
+            and attn_metadata.max_query_len == rows // num_reqs
+            and attn_metadata.req_id_per_token is not None
+            and attn_metadata.page_table_1 is not None
+            and attn_metadata.nsa_cache_seqlens is not None
+            and attn_metadata.global_cache_seq_lens_per_req is not None
+        )
+
+    def _dcp_gather_sparse_decode_ckv(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata: B12xMLASparseMetadata,
+        topk_indices: torch.Tensor,
+        buf_idx: int = 0,
+        stream: torch.cuda.Stream | None = None,
+        build_union: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_rows = int(topk_indices.shape[0])
+        num_reqs = int(attn_metadata.num_reqs)
+        rows_per_req = num_rows // num_reqs
+        per_req_capacity = self._sparse_decode_per_req_capacity
+        active_capacity = num_reqs * per_req_capacity
+        if not self.dcp_sparse_decode_ckv_gather_eligible(
+            attn_metadata, num_rows
+        ):
+            raise RuntimeError(
+                "Sparse decode CKV gather called for an ineligible batch"
+            )
+        if self._sparse_decode_workspace is None:
+            raise RuntimeError("Sparse decode CKV workspace was not initialized")
+        if self._sparse_decode_selected_indices is None:
+            raise RuntimeError("Sparse decode CKV indices were not initialized")
+        if self._sparse_decode_union_indices is None:
+            raise RuntimeError("Sparse decode CKV union was not initialized")
+        if self._sparse_decode_union_count is None:
+            raise RuntimeError("Sparse decode CKV union count was not initialized")
+        if self._sparse_decode_hash_keys is None:
+            raise RuntimeError("Sparse decode CKV hash keys were not initialized")
+        if self._sparse_decode_hash_values is None:
+            raise RuntimeError("Sparse decode CKV hash values were not initialized")
+        if self._sparse_decode_local_slots is None:
+            raise RuntimeError("Sparse decode CKV local slots were not initialized")
+        if self._sparse_decode_all_rank_topk is None:
+            raise RuntimeError("Sparse decode CKV rank top-k was not initialized")
+        if self._sparse_decode_all_rank_topk_by_req is None:
+            raise RuntimeError("Sparse decode CKV request top-k was not initialized")
+        if self._sparse_decode_all_rank_remap is None:
+            raise RuntimeError("Sparse decode CKV rank remap was not initialized")
+        if self._sparse_decode_req_ids is None:
+            raise RuntimeError("Sparse decode CKV request ids were not initialized")
+        if not 0 <= int(buf_idx) < self._sparse_decode_workspace_slots:
+            raise ValueError(
+                f"Sparse decode CKV buffer index {buf_idx} is outside "
+                f"[0, {self._sparse_decode_workspace_slots})"
+            )
+
+        assert attn_metadata.req_id_per_token is not None
+        assert attn_metadata.page_table_1 is not None
+        assert attn_metadata.nsa_cache_seqlens is not None
+        assert attn_metadata.global_cache_seq_lens_per_req is not None
+        workspace = self._sparse_decode_workspace.view(
+            self._sparse_decode_workspace_slots,
+            self._sparse_decode_padded_topk,
+            self._kv_record_bytes,
+        )
+        packed = workspace[buf_idx : buf_idx + 1, :active_capacity]
+        local_slots_by_destination = self._sparse_decode_local_slots[
+            : self._sparse_decode_destination_count, :num_reqs
+        ]
+        union_indices_by_destination = self._sparse_decode_union_indices[
+            : self._sparse_decode_destination_count, :num_reqs
+        ]
+        local_destination = (
+            self.dcp_rank if self._sparse_decode_destination_scatter else 0
+        )
+        union_indices_by_req = union_indices_by_destination[local_destination]
+        local_slots = (
+            local_slots_by_destination
+            if self._sparse_decode_destination_scatter
+            else local_slots_by_destination.reshape(1, active_capacity)
+        )
+        union_indices = union_indices_by_req.reshape(1, active_capacity)
+        caller_stream = torch.cuda.current_stream()
+        use_p2p = bool(
+            self._sparse_decode_ckv_transport
+            in ("p2p", "p2p_scatter", "p2p_ce_scatter")
+            and self._sparse_decode_p2p is not None
+        )
+        use_p2p_scatter = bool(
+            self._sparse_decode_ckv_transport
+            in ("p2p_scatter", "p2p_ce_scatter")
+            and self._sparse_decode_p2p is not None
+        )
+        use_p2p_ce_scatter = bool(
+            self._sparse_decode_ckv_transport == "p2p_ce_scatter"
+            and self._sparse_decode_p2p is not None
+        )
+        if self._sparse_decode_destination_scatter and not use_p2p_scatter:
+            raise RuntimeError(
+                "Destination-specific sparse CKV state requires direct P2P scatter"
+            )
+        if use_p2p and stream is not None:
+            if self._ckv_gather_stream is None:
+                raise RuntimeError("Sparse CKV P2P requires a gather stream")
+            execution_stream = self._ckv_gather_stream
+            execution_stream.wait_stream(caller_stream)
+        elif stream is not None:
+            stream.wait_stream(caller_stream)
+            execution_stream = stream
+        else:
+            execution_stream = caller_stream
+
+        with torch.cuda.stream(execution_stream):
+            if build_union:
+                from vllm.v1.attention.backends.mla.b12x_sparse_ckv_p2p import (
+                    build_b12x_sparse_ckv_union_remap,
+                )
+
+                local_topk = topk_indices[
+                    :num_rows, : self.topk_tokens
+                ].contiguous()
+                all_rank_rows = self.dcp_world_size * num_rows
+                all_rank_topk = self._sparse_decode_all_rank_topk[:all_rank_rows]
+                from vllm.distributed.parallel_state import get_dcp_group
+
+                _dcp_all_gather_current_stream(
+                    get_dcp_group(), local_topk, all_rank_topk
+                )
+                # Speculative decoding may schedule fewer than the configured
+                # maximum number of MTP rows near request boundaries.
+                all_rank_topk_by_req = self._sparse_decode_all_rank_topk_by_req[
+                    :num_reqs, :, :rows_per_req
+                ]
+                all_rank_topk_by_req.copy_(
+                    all_rank_topk.view(
+                        self.dcp_world_size,
+                        num_reqs,
+                        rows_per_req,
+                        self.topk_tokens,
+                    ).permute(1, 0, 2, 3),
+                    non_blocking=True,
+                )
+                for req_index in range(num_reqs):
+                    for destination in range(self._sparse_decode_destination_count):
+                        if self._sparse_decode_destination_scatter:
+                            destination_topk = all_rank_topk_by_req[
+                                req_index, destination
+                            ]
+                            local_row_start = 0
+                        else:
+                            destination_topk = all_rank_topk_by_req[
+                                req_index
+                            ].view(-1, self.topk_tokens)
+                            local_row_start = self.dcp_rank * rows_per_req
+                        destination_rows = int(destination_topk.shape[0])
+                        destination_remap = self._sparse_decode_all_rank_remap[
+                            req_index, destination, :destination_rows
+                        ]
+                        build_b12x_sparse_ckv_union_remap(
+                            destination_topk,
+                            union_indices_by_destination[destination, req_index],
+                            destination_remap,
+                            self._sparse_decode_union_count[
+                                destination, req_index : req_index + 1
+                            ],
+                            self._sparse_decode_hash_keys[destination, req_index],
+                            self._sparse_decode_hash_values[destination, req_index],
+                        )
+                        if destination == local_destination:
+                            selected_start = req_index * rows_per_req
+                            selected = self._sparse_decode_selected_indices[
+                                selected_start : selected_start + rows_per_req,
+                                : self.topk_tokens,
+                            ]
+                            selected.copy_(
+                                destination_remap[
+                                    local_row_start : local_row_start + rows_per_req
+                                ],
+                                non_blocking=True,
+                            )
+                            if req_index:
+                                _offset_sparse_decode_remap(
+                                    selected, req_index * per_req_capacity
+                                )
+
+            for destination in range(self._sparse_decode_destination_count):
+                triton_filter_and_convert_dcp_index(
+                    self._sparse_decode_req_ids[:num_reqs],
+                    attn_metadata.block_table,
+                    union_indices_by_destination[destination],
+                    dcp_size=self.dcp_world_size,
+                    dcp_rank=self.dcp_rank,
+                    cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=per_req_capacity,
+                    compact_valid_to_front=False,
+                    out=local_slots_by_destination[destination],
+                )
+            if use_p2p:
+                if use_p2p_ce_scatter:
+                    transfer = self._sparse_decode_p2p.transfer_scatter_ce
+                elif use_p2p_scatter:
+                    transfer = self._sparse_decode_p2p.transfer_scatter
+                else:
+                    transfer = self._sparse_decode_p2p.transfer
+                transfer(
+                    kv_cache,
+                    local_slots,
+                    union_indices,
+                    packed,
+                    workspace_slot=buf_idx,
+                    interleave=self.cp_kv_cache_interleave_size,
+                )
+            else:
+                _pack_sparse_decode_ckv_local(kv_cache, local_slots, packed)
+
+                from vllm.distributed.parallel_state import (
+                    get_dcp_ckv_prefetch_group,
+                    get_dcp_group,
+                )
+
+                dcp_group = (
+                    get_dcp_ckv_prefetch_group()
+                    if stream is not None
+                    else get_dcp_group()
+                )
+                _dcp_all_reduce_current_stream(dcp_group, packed)
+
+        selected_indices = self._sparse_decode_selected_indices[
+            :num_rows, : self.topk_tokens
+        ]
+        nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[:num_rows]
+        if stream is None:
+            global_causal_lens = _global_causal_lens_for_ckv_gather(
+                attn_metadata.global_cache_seq_lens_per_req,
+                attn_metadata.query_start_loc,
+                attn_metadata.req_id_per_token,
+                num_rows,
+            )
+            nsa_cache_seqlens.copy_(global_causal_lens, non_blocking=True)
+            nsa_cache_seqlens.clamp_(max=self.topk_tokens)
+            _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
+        gathered_cache = packed.view(-1, self.block_size, self._kv_record_bytes)
+        return gathered_cache, selected_indices, nsa_cache_seqlens
+
+    def _append_current_token_to_sparse_decode_gathered(
+        self,
+        gathered_cache: torch.Tensor,
+        attn_metadata: B12xMLASparseMetadata,
+        union_indices: torch.Tensor,
+        global_causal_lens: torch.Tensor,
+        layer,
+    ) -> None:
+        """Patch a prefetched Shared-layer cache with all current MTP tokens."""
+        if self._ckv_current_chunk_kv_c is None:
+            raise RuntimeError("Sparse decode prefetch is missing current CKV")
+        if self._ckv_current_chunk_kpe is None:
+            raise RuntimeError("Sparse decode prefetch is missing current RoPE")
+        if self._sparse_decode_patch_slot is None:
+            raise RuntimeError("Sparse decode patch slot was not initialized")
+        if attn_metadata.req_id_per_token is None:
+            raise RuntimeError("Sparse decode patch is missing request ids")
+
+        _find_sparse_decode_current_token_slot(
+            union_indices,
+            attn_metadata.req_id_per_token[: global_causal_lens.numel()],
+            global_causal_lens,
+            self._sparse_decode_patch_slot[: global_causal_lens.numel()],
+        )
+        num_rows = int(global_causal_lens.numel())
+        kv_c = self._ckv_current_chunk_kv_c[:num_rows]
+        k_pe = self._ckv_current_chunk_kpe[:num_rows]
+        if k_pe.ndim == 3:
+            k_pe = k_pe.squeeze(1)
+        ops.concat_and_cache_mla(
+            kv_c,
+            k_pe,
+            gathered_cache,
+            self._sparse_decode_patch_slot[:num_rows],
+            self.kv_cache_dtype,
+            getattr(layer, "_k_scale", None),
+        )
+
     def _dcp_gather_ckv(
         self,
         kv_cache: torch.Tensor,
@@ -1646,17 +2663,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         assert attn_metadata.dcp_local_cu_seq_lens is not None
         padded_tokens = attn_metadata.dcp_padded_total_tokens
         local_tokens = attn_metadata.dcp_local_total_tokens
-        self._validate_ckv_workspace(ckv_workspace)
-        half_nbytes = (
-            (self.dcp_world_size + 1) * self._ckv_local_capacity * self._kv_record_bytes
+        local_buffer, gathered_buffer = self._ckv_workspace_views(
+            ckv_workspace, buf_idx
         )
-        ws_half = ckv_workspace.view(-1, self._kv_record_bytes)
-        base = buf_idx * (half_nbytes // self._kv_record_bytes)
-        local_buffer = ws_half[base : base + self._ckv_local_capacity]
-        gathered_buffer = ws_half[
-            base + self._ckv_local_capacity : base
-            + self._ckv_local_capacity * (self.dcp_world_size + 1)
-        ]
         if stream is not None:
             # The side stream must observe the default stream's prior writes
             # to the paged KV cache (this and earlier steps' do_kv_cache_update)
@@ -1806,7 +2815,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 slots,
                 k_scale,
             )
-        elif self.kv_cache_dtype == "fp8_ds_mla":
+        elif self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla"):
             ops.concat_and_cache_mla(
                 kv_c,
                 k_pe_flat,
@@ -1819,7 +2828,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             raise RuntimeError(
                 "CKV gather prefetch append is not yet supported for "
                 f"kv_cache_dtype={self.kv_cache_dtype!r}; disable prefetch "
-                "or use fp8_ds_mla / KV_FP8_ROPE."
+                "or use fp8_ds_mla / nvfp4_ds_mla."
             )
 
     def _sync_warmup(self) -> None:
@@ -1946,15 +2955,21 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         use_ckv_gather = self.dcp_prefill_ckv_gather_eligible(
             attn_metadata, int(query_rows)
         )
+        use_sparse_decode_ckv_gather = (
+            self.dcp_sparse_decode_ckv_gather_eligible(
+                attn_metadata, int(query_rows)
+            )
+        )
+        use_local_query_heads = use_ckv_gather or use_sparse_decode_ckv_gather
         workspace_tensors = self._borrow_workspaces()
         q_workspace = workspace_tensors[0]
         dense_out_workspace = workspace_tensors[1] if self._pad_heads else None
         ckv_workspace = self._ckv_workspace
         scratch_storage = workspace_tensors[-1]
         expected_input_heads = (
-            self.num_heads if use_ckv_gather else self._input_num_heads
+            self.num_heads if use_local_query_heads else self._input_num_heads
         )
-        if use_ckv_gather:
+        if use_local_query_heads:
             local_q_numel = (
                 self._max_batched * self._ckv_kernel_num_heads * self.q_head_dim
             )
@@ -2001,6 +3016,18 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
         per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
+        sparse_decode_global_causal_lens = None
+        if use_sparse_decode_ckv_gather:
+            assert attn_metadata.global_cache_seq_lens_per_req is not None
+            assert attn_metadata.req_id_per_token is not None
+            sparse_decode_global_causal_lens = (
+                _global_causal_lens_for_ckv_gather(
+                    attn_metadata.global_cache_seq_lens_per_req,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.req_id_per_token,
+                    num_actual_toks,
+                )
+            )
         if use_ckv_gather:
             assert attn_metadata.req_id_per_token is not None
             assert attn_metadata.ckv_page_table_1 is not None
@@ -2043,6 +3070,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 out=nsa_cache_seqlens,
             )
             _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
+        elif use_sparse_decode_ckv_gather:
+            # Preserve the global logical top-k until selected native records
+            # have been materialized into the sparse workspace below.
+            selected_indices = topk_indices
+            nsa_cache_seqlens = per_token_cache
         elif self.dcp_world_size > 1:
             # The indexer globally merges logical top-k ids across DCP ranks.
             # Compact just this rank's winners into local physical cache slots;
@@ -2108,6 +3140,156 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 "B12X_MLA_SPARSE requires a contiguous native paged KV cache; "
                 f"got stride={tuple(kv_cache.stride())}"
             )
+        if use_sparse_decode_ckv_gather:
+            layer_idx = self._resolve_layer_index(layer)
+            if layer_idx is not None:
+                while len(B12xMLASparseImpl._all_layer_kv_caches) <= layer_idx:
+                    B12xMLASparseImpl._all_layer_kv_caches.append(None)
+                while len(B12xMLASparseImpl._all_layer_sparse_impls) <= layer_idx:
+                    B12xMLASparseImpl._all_layer_sparse_impls.append(None)
+                B12xMLASparseImpl._all_layer_kv_caches[layer_idx] = kv_cache
+                B12xMLASparseImpl._all_layer_sparse_impls[layer_idx] = self
+
+            pending_gather = (
+                B12xMLASparseImpl._sparse_decode_gather_events.pop(layer_idx, None)
+                if layer_idx is not None
+                else None
+            )
+            if pending_gather is not None:
+                gather_event, gather_buf_idx = pending_gather
+                # During CUDA-graph capture the Full layer queues all three
+                # Shared-layer transfers on the captured main stream. Stream
+                # FIFO already provides the dependency, so no event is needed.
+                if gather_event is not None:
+                    torch.cuda.current_stream().wait_event(gather_event)
+                if self._sparse_decode_workspace is None:
+                    raise RuntimeError(
+                        "Sparse decode CKV workspace was not initialized"
+                    )
+                if self._sparse_decode_union_indices is None:
+                    raise RuntimeError("Sparse decode CKV union was not initialized")
+                if self._sparse_decode_selected_indices is None:
+                    raise RuntimeError("Sparse decode CKV remap was not initialized")
+                if sparse_decode_global_causal_lens is None:
+                    raise RuntimeError(
+                        "Sparse decode CKV gather is missing global causal lengths"
+                    )
+                sparse_workspace = self._sparse_decode_workspace.view(
+                    self._sparse_decode_workspace_slots,
+                    self._sparse_decode_padded_topk,
+                    self._kv_record_bytes,
+                )
+                active_num_reqs = int(attn_metadata.num_reqs)
+                active_capacity = (
+                    active_num_reqs * self._sparse_decode_per_req_capacity
+                )
+                kv_cache = sparse_workspace[
+                    gather_buf_idx : gather_buf_idx + 1, :active_capacity
+                ].view(-1, self.block_size, self._kv_record_bytes)
+                self._append_current_token_to_sparse_decode_gathered(
+                    kv_cache,
+                    attn_metadata,
+                    (
+                        self._sparse_decode_union_indices[
+                            self.dcp_rank, :active_num_reqs
+                        ]
+                        if self._sparse_decode_destination_scatter
+                        else self._sparse_decode_union_indices[
+                            0, :active_num_reqs
+                        ]
+                    ),
+                    sparse_decode_global_causal_lens,
+                    layer,
+                )
+                selected_indices = self._sparse_decode_selected_indices[
+                    :num_actual_toks, : self.topk_tokens
+                ]
+                nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[
+                    :num_actual_toks
+                ]
+                nsa_cache_seqlens.copy_(
+                    sparse_decode_global_causal_lens, non_blocking=True
+                )
+                nsa_cache_seqlens.clamp_(max=self.topk_tokens)
+                _mask_page_table_after_nsa_len(
+                    selected_indices, nsa_cache_seqlens
+                )
+            else:
+                sync_buf_idx = (
+                    layer_idx % self._sparse_decode_workspace_slots
+                    if layer_idx is not None
+                    else 0
+                )
+                kv_cache, selected_indices, nsa_cache_seqlens = (
+                    self._dcp_gather_sparse_decode_ckv(
+                        kv_cache,
+                        attn_metadata,
+                        topk_indices,
+                        buf_idx=sync_buf_idx,
+                    )
+                )
+
+            logger.info_once(
+                "Using lossless selected-record CKV union gather for C<=%d/MTP "
+                "DCP decode (rows_per_req<=%d topk=%d pooled_capacity=%d "
+                "record_bytes=%d shared_prefetch_depth=%d transport=%s "
+                "destination_scatter=%s)",
+                self._sparse_decode_max_reqs,
+                self._sparse_decode_rows_per_req,
+                self.topk_tokens,
+                self._sparse_decode_padded_topk,
+                self._kv_record_bytes,
+                self._sparse_decode_prefetch_depth,
+                self._sparse_decode_ckv_transport,
+                self._sparse_decode_destination_scatter,
+            )
+
+            if (
+                self._sparse_decode_emits_topk
+                and layer_idx is not None
+                and self._ckv_gather_stream is not None
+            ):
+                capturing = torch.cuda.is_current_stream_capturing()
+                emits_topk_by_layer = [
+                    None if impl is None else impl._sparse_decode_emits_topk
+                    for impl in B12xMLASparseImpl._all_layer_sparse_impls
+                ]
+                target_indices = _sparse_decode_prefetch_targets(
+                    layer_idx,
+                    self._sparse_decode_prefetch_depth,
+                    emits_topk_by_layer,
+                )
+                for target_idx in target_indices:
+                    if target_idx in B12xMLASparseImpl._sparse_decode_gather_events:
+                        continue
+                    target_impl = B12xMLASparseImpl._all_layer_sparse_impls[
+                        target_idx
+                    ]
+                    target_kv = B12xMLASparseImpl._all_layer_kv_caches[target_idx]
+                    if target_impl is None or target_kv is None:
+                        break
+                    target_buf_idx = (
+                        target_idx % self._sparse_decode_workspace_slots
+                    )
+                    target_impl._dcp_gather_sparse_decode_ckv(
+                        target_kv,
+                        attn_metadata,
+                        topk_indices,
+                        buf_idx=target_buf_idx,
+                        # Multi-stream event plumbing is not graph-safe here.
+                        # Capture the same depth-3 schedule on the main stream;
+                        # eager execution keeps the overlapping side stream.
+                        stream=None if capturing else self._ckv_gather_stream,
+                        build_union=False,
+                    )
+                    target_event = None
+                    if not capturing:
+                        target_event = torch.cuda.Event(blocking=False)
+                        target_event.record(self._ckv_gather_stream)
+                    B12xMLASparseImpl._sparse_decode_gather_events[target_idx] = (
+                        target_event,
+                        target_buf_idx,
+                    )
         if use_ckv_gather:
             if ckv_workspace is None:
                 raise RuntimeError("CKV gather workspace was not borrowed")
@@ -2116,21 +3298,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 while len(B12xMLASparseImpl._all_layer_kv_caches) <= layer_idx:
                     B12xMLASparseImpl._all_layer_kv_caches.append(None)
                 B12xMLASparseImpl._all_layer_kv_caches[layer_idx] = kv_cache
-            if B12xMLASparseImpl._shared_gather_event is not None:
-                B12xMLASparseImpl._shared_gather_event.wait()
-                half_nbytes = (
-                    (self.dcp_world_size + 1)
-                    * self._ckv_local_capacity
-                    * self._kv_record_bytes
+            pending = (
+                B12xMLASparseImpl._shared_gather_events.pop(layer_idx, None)
+                if layer_idx is not None
+                else None
+            )
+            if pending is not None:
+                gather_event, current_buf_idx = pending
+                gather_event.wait()
+                _, gathered_buffer = self._ckv_workspace_views(
+                    ckv_workspace, current_buf_idx
                 )
-                ws_half = ckv_workspace.view(-1, self._kv_record_bytes)
-                base = B12xMLASparseImpl._shared_gather_buf_idx * (
-                    half_nbytes // self._kv_record_bytes
-                )
-                gathered_buffer = ws_half[
-                    base + self._ckv_local_capacity : base
-                    + self._ckv_local_capacity * (self.dcp_world_size + 1)
-                ]
                 kv_cache = gathered_buffer[
                     : self.dcp_world_size * self._ckv_local_capacity
                 ].view(-1, self.block_size, self._kv_record_bytes)
@@ -2138,34 +3316,55 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache, attn_metadata, layer, num_actual_toks
                 )
             else:
-                kv_cache = self._dcp_gather_ckv(kv_cache, attn_metadata, ckv_workspace)
+                current_buf_idx = (
+                    layer_idx % self._ckv_workspace_slots
+                    if layer_idx is not None
+                    else 0
+                )
+                kv_cache = self._dcp_gather_ckv(
+                    kv_cache,
+                    attn_metadata,
+                    ckv_workspace,
+                    buf_idx=current_buf_idx,
+                )
             logger.info_once(
                 "Using transient full-CKV gather for B12X sparse MLA prefill "
                 "(capacity=%d logical tokens)",
                 self._ckv_gather_max_tokens,
             )
-            if (
-                self._ckv_prefetch_supported
-                and layer_idx is not None
-                and layer_idx + 1 < len(B12xMLASparseImpl._all_layer_kv_caches)
-                and B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1] is not None
-            ):
-                next_kv = B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1]
-                next_buf_idx = 1 - B12xMLASparseImpl._shared_gather_buf_idx
-                self._dcp_gather_ckv(
-                    next_kv,
-                    attn_metadata,
-                    ckv_workspace,
-                    buf_idx=next_buf_idx,
-                    stream=self._ckv_gather_stream,
+            if self._ckv_prefetch_supported and layer_idx is not None:
+                targets = _ckv_prefetch_target_indices(
+                    layer_idx,
+                    self._ckv_prefetch_depth,
+                    B12xMLASparseImpl._all_layer_kv_caches,
+                    B12xMLASparseImpl._shared_gather_events,
                 )
-                B12xMLASparseImpl._shared_gather_event = torch.cuda.Event(
-                    blocking=False
-                )
-                B12xMLASparseImpl._shared_gather_event.record(self._ckv_gather_stream)
-                B12xMLASparseImpl._shared_gather_buf_idx = next_buf_idx
+                if layer_idx == 0 and not targets:
+                    logger.info_once(
+                        "CKV layer prefetch registry is warming; the first "
+                        "eligible request uses synchronous gathers."
+                    )
+                for target_idx in targets:
+                    target_kv = B12xMLASparseImpl._all_layer_kv_caches[target_idx]
+                    assert target_kv is not None
+                    target_buf_idx = target_idx % self._ckv_workspace_slots
+                    self._dcp_gather_ckv(
+                        target_kv,
+                        attn_metadata,
+                        ckv_workspace,
+                        buf_idx=target_buf_idx,
+                        stream=self._ckv_gather_stream,
+                    )
+                    target_event = torch.cuda.Event(blocking=False)
+                    target_event.record(self._ckv_gather_stream)
+                    B12xMLASparseImpl._shared_gather_events[target_idx] = (
+                        target_event,
+                        target_buf_idx,
+                    )
 
-        use_decode_kernel = attn_metadata.max_query_len <= 1 or (
+        use_decode_kernel = use_sparse_decode_ckv_gather or (
+            attn_metadata.max_query_len <= 1
+        ) or (
             self.spec_extend_as_decode
             and attn_metadata.max_query_len <= self.spec_decode_max_q
             and num_actual_toks <= attn_metadata.num_reqs * self.spec_decode_max_q
@@ -2173,25 +3372,41 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         )
         if use_decode_kernel:
             cache_seqlens = (
-                attn_metadata.cache_seq_lens_per_req
+                sparse_decode_global_causal_lens
+                if use_sparse_decode_ckv_gather
+                else attn_metadata.cache_seq_lens_per_req
                 if attn_metadata.max_query_len <= 1
                 else attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
             )
+            if cache_seqlens is None:
+                raise RuntimeError(
+                    "Sparse decode CKV gather is missing global sequence lengths"
+                )
             decode_q = q_all
-            if self._pad_heads:
+            if self._pad_heads and not use_sparse_decode_ckv_gather:
                 decode_q = q_buffer[:, : self._kernel_num_heads]
                 decode_q[:, self._input_num_heads :, :].zero_()
             # Eager bind maps caller-owned scratch into views. forced_num_splits
             # pins the planner choice for this captured graph; the merge kernel is
             # specialized on that count and needs no device-side control fill.
-            binding = self._decode_plan.bind(
+            if use_sparse_decode_ckv_gather:
+                decode_plan = (
+                    self._sparse_decode_plan
+                    if int(attn_metadata.num_reqs) == 1
+                    else self._sparse_decode_batch_plan
+                )
+            else:
+                decode_plan = self._decode_plan
+            if decode_plan is None:
+                raise RuntimeError("Sparse decode CKV plan was not initialized")
+            binding = decode_plan.bind(
                 scratch=scratch_storage,
                 q=decode_q,
                 selected_indices=selected_indices,
                 cache_seqlens_int32=cache_seqlens,
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
             )
-            if self.need_to_return_lse_for_decode:
+            if self.need_to_return_lse_for_decode and not use_sparse_decode_ckv_gather:
                 out, lse = cast(
                     tuple[torch.Tensor, torch.Tensor],
                     self._sparse_mla_decode_forward(
@@ -2223,7 +3438,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     **kernel_format_kwargs,
                 ),
             )
-            if self._pad_heads:
+            if self._pad_heads and not use_sparse_decode_ckv_gather:
                 assert dense_out_workspace is not None
                 dense_out = dense_out_workspace[:num_actual_toks]
                 dense_out.copy_(out[:, : self._input_num_heads, :])

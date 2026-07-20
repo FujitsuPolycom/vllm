@@ -7,7 +7,10 @@ import torch
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
-from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
+from vllm.v1.attention.backends.mla.indexer import (
+    build_prefill_chunk_metadata,
+    get_indexer_max_num_blocks_per_req,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
@@ -17,6 +20,28 @@ from vllm.v1.attention.ops.common import CPTritonContext, correct_attn_out
 
 def _local_count(length: int, rank: int, world: int, interleave: int) -> int:
     return sum(1 for pos in range(length) if (pos // interleave) % world == rank)
+
+
+def test_replicated_indexer_metadata_covers_full_context():
+    max_model_len = 131072
+    dcp_world_size = 4
+
+    sharded_blocks = get_indexer_max_num_blocks_per_req(
+        max_model_len=max_model_len,
+        block_size=64,
+        configured_cp_world_size=dcp_world_size,
+        dcp_replicated=False,
+    )
+    replicated_blocks = get_indexer_max_num_blocks_per_req(
+        max_model_len=max_model_len,
+        block_size=256,
+        configured_cp_world_size=dcp_world_size,
+        dcp_replicated=True,
+    )
+
+    assert sharded_blocks == 512
+    assert replicated_blocks == 512
+    assert replicated_blocks * 256 == max_model_len
 
 
 def _global_to_local_indices(
@@ -89,6 +114,16 @@ def _attention_from_indices(
     v: torch.Tensor,
     indices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if k.shape[0] == 0:
+        return (
+            torch.zeros_like(q),
+            torch.full(
+                (q.shape[0],),
+                float("-inf"),
+                dtype=q.dtype,
+                device=q.device,
+            ),
+        )
     valid = indices >= 0
     safe_indices = indices.clamp_min(0)
     selected_k = k[safe_indices]
@@ -253,7 +288,7 @@ def _merge_local_topks_global_with_fake_dcp(
         sparse_indexer.get_dcp_group = original_get_dcp_group
 
 
-@pytest.mark.parametrize("world", [1, 2, 4])
+@pytest.mark.parametrize("world", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("interleave", [1, 2, 4])
 def test_get_dcp_local_seq_lens_matches_naive(world: int, interleave: int):
     seq_lens = torch.arange(0, 33, dtype=torch.int32)
@@ -341,9 +376,11 @@ def test_get_dcp_local_seq_lens_must_run_after_decode_expansion():
 
 
 @pytest.mark.parametrize("interleave", [1, 2])
-def test_sparse_dcp_attention_matches_global_topk_attention(interleave: int):
+@pytest.mark.parametrize("world", [2, 4, 6, 8])
+def test_sparse_dcp_attention_matches_global_topk_attention(
+    interleave: int, world: int
+):
     torch.manual_seed(0)
-    world = 2
     topk = 3
     num_queries = 4
     max_seq_len = 13
@@ -743,6 +780,79 @@ def test_dcp_filter_compaction_matches_reference(interleave: int, dcp_rank: int)
         assert (out[r, :n] >= 0).all()
         assert (out[r, n:] == -1).all()
         assert set(out[r, :n].cpu().tolist()) == set(expected.cpu().tolist())
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("dcp_size", [2, 4, 6, 8])
+def test_dcp_filter_tracks_prefix_aliases_and_block_reuse_in_graph(dcp_size: int):
+    """Physical block aliases and later block reuse must be read at replay time."""
+    device = torch.device("cuda")
+    block_size = 64
+    num_topk = 128
+    req_id = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    local_indices = torch.arange(num_topk, dtype=torch.int32, device=device)
+    token_indices = (local_indices * dcp_size).repeat(2, 1).contiguous()
+    block_table = torch.tensor(
+        [[7, 11], [7, 19]], dtype=torch.int32, device=device
+    )
+    out = torch.empty_like(token_indices)
+    valid_counts = torch.empty(2, dtype=torch.int32, device=device)
+
+    def run() -> None:
+        triton_filter_and_convert_dcp_index(
+            req_id,
+            block_table,
+            token_indices,
+            dcp_size=dcp_size,
+            dcp_rank=0,
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=num_topk,
+            return_valid_counts=True,
+            compact_valid_to_front=False,
+            out=out,
+            valid_counts=valid_counts,
+        )
+
+    run()
+    torch.accelerator.synchronize()
+    expected_shared = 7 * block_size + torch.arange(
+        block_size, dtype=torch.int32, device=device
+    )
+    torch.testing.assert_close(out[0, :block_size], expected_shared)
+    torch.testing.assert_close(out[1, :block_size], expected_shared)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    # Request 1 stops sharing the prefix block, reuses two new physical blocks,
+    # and shortens its selected set. Replaying the same graph must observe all
+    # three metadata changes rather than retaining captured physical slots.
+    block_table[1].copy_(
+        torch.tensor([23, 29], dtype=torch.int32, device=device)
+    )
+    token_indices[1, 96:].fill_(-1)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    expected_req0 = torch.cat(
+        (
+            7 * block_size + torch.arange(block_size, device=device),
+            11 * block_size + torch.arange(block_size, device=device),
+        )
+    ).to(torch.int32)
+    expected_req1 = torch.cat(
+        (
+            23 * block_size + torch.arange(block_size, device=device),
+            29 * block_size + torch.arange(32, device=device),
+            torch.full((32,), -1, dtype=torch.int64, device=device),
+        )
+    ).to(torch.int32)
+    torch.testing.assert_close(out[0], expected_req0)
+    torch.testing.assert_close(out[1], expected_req1)
+    torch.testing.assert_close(
+        valid_counts, torch.tensor([128, 96], dtype=torch.int32, device=device)
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")

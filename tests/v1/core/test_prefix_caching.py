@@ -48,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -175,6 +176,87 @@ def make_kv_cache_config_hybrid_model(
             ),
         ],
     )
+
+
+def test_uniform_replicated_mla_groups_allocate_lockstep_block_ids():
+    global_block_size = 256
+    target_spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=432,
+        dtype=torch.uint8,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=global_block_size,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_replicated=True,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], target_spec),
+            KVCacheGroupSpec(["indexer"], indexer_spec),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=4 * global_block_size,
+        scheduler_block_size=global_block_size,
+        hash_block_size=global_block_size,
+        enable_caching=True,
+        dcp_world_size=4,
+    )
+    with pytest.raises(NotImplementedError, match="External KV loads"):
+        manager.coordinator.allocate_new_computed_blocks(
+            "external",
+            ([], []),
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=global_block_size,
+        )
+    request = make_request(
+        "lockstep",
+        list(range(4 * global_block_size)),
+        global_block_size,
+        sha256,
+    )
+
+    for _ in range(4):
+        blocks = manager.allocate_slots(
+            request,
+            num_new_tokens=global_block_size,
+            full_sequence_must_fit=True,
+        )
+        assert blocks is not None
+        request.num_computed_tokens += global_block_size
+
+    target_ids, indexer_ids = (
+        [block.block_id for block in group]
+        for group in manager.coordinator.get_blocks(request.request_id)
+    )
+    assert target_ids == indexer_ids
+    assert len(target_ids) == 4
+    assert manager.block_pool.get_num_free_blocks() == 1
+    assert all(
+        manager.block_pool.blocks[block_id].ref_cnt == 2 for block_id in target_ids
+    )
+
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 5
+
+    replay = make_request(
+        "lockstep-replay",
+        list(range(4 * global_block_size)),
+        global_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 3 * global_block_size
+    assert [block.block_id for block in computed_blocks.blocks[0]] == [
+        block.block_id for block in computed_blocks.blocks[1]
+    ]
 
 
 def make_kv_cache_config_three_types(

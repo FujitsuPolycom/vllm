@@ -1683,6 +1683,70 @@ def test_resolve_kv_cache_block_sizes_mixed_dcp_replicated_groups():
     assert hash_block_size == 64
 
 
+def test_replicated_indexer_uses_real_uniform_groups_and_lockstep_pool():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=262144),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        kv_transfer_config=None,
+    )
+    specs: dict[str, KVCacheSpec] = {
+        f"target.{i}": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.uint8,
+            cache_dtype_str="nvfp4_ds_mla",
+        )
+        for i in range(3)
+    }
+    specs.update(
+        {
+            f"indexer.{i}": MLAAttentionSpec(
+                block_size=256,
+                num_kv_heads=1,
+                head_size=132,
+                dtype=torch.uint8,
+                dcp_replicated=True,
+            )
+            for i in range(2)
+        }
+    )
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(specs)
+    assert grouped_specs is not None
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
+    )
+    assert kv_cache_utils._use_lockstep_mla_allocation(groups, 4, 1)
+
+    bytes_per_pool_block = 3 * (64 * 432) + 2 * (256 * 132)
+    request_blocks = 262144 // 256
+    required_memory = bytes_per_pool_block * request_blocks
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=required_memory * 2,
+    )
+
+    assert kv_cache_config.num_blocks == request_blocks * 2
+    assert all(tensor.block_stride == 0 for tensor in kv_cache_config.kv_cache_tensors)
+    assert sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors) == (
+        required_memory * 2
+    )
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == required_memory
+    )
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    ) == pytest.approx(2.0)
+
+
 def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
     from vllm.v1.engine.core import EngineCore
 
