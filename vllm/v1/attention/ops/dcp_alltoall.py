@@ -545,9 +545,12 @@ def _dcp_a2a_send_recv_buffers(
         # FULL graphs share a global graph pool. Without a live Python owner,
         # a larger descriptor's staging allocation can be recycled while a
         # smaller descriptor is captured, leaving both NCCL graph nodes bound
-        # to the same address. Keep one exact-shape pair alive per device so
-        # descriptors cannot alias each other's A2A staging storage. Layers of
-        # one graph may reuse the pair because all operations are stream-ordered.
+        # to the same address. The vLLM capture scope starts before each eager
+        # graph prewarm, so this also allocates the retained pair before CUDA
+        # capture begins instead of from the shared graph pool. Keep one
+        # exact-shape pair alive per device so descriptors cannot alias each
+        # other's A2A staging storage. Layers of one graph may reuse the pair
+        # because all operations are stream-ordered.
         key = (shape, device, dtype)
         buffers = _DCP_A2A_GRAPH_BUFFERS.get(key)
         if buffers is None:
