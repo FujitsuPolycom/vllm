@@ -1,0 +1,51 @@
+{
+  "release": "glm52-sparse-ckv-v19-20260721",
+  "base_image": {
+    "repository": "voipmonitor/vllm",
+    "tag_used_during_validation": "gilded-gnosis-v19-vllm7ea567a-b12x4cfa530-fi801d57a-cu132-20260718",
+    "digest": "sha256:41078d5fac36b802e0f3798057a4b383c24296cb8570f6f4fc138c34d8cfa303"
+  },
+  "vllm": {
+    "repository": "https://github.com/FujitsuPolycom/vllm.git",
+    "branch": "codex/sparse-ckv-bulk-prefetch",
+    "base_image_source_commit": "7ea567a2458a4800a6a0e3e0a6ba41fcbd00d146",
+    "commit": "a81a0811314e23bc6b2baa69f34247aacea71e23"
+  },
+  "sparkinfer": {
+    "repository": "https://github.com/FujitsuPolycom/sparkinfer.git",
+    "branch": "codex/sparse-ckv-release-20260721",
+    "commit": "a82fc76f9a2321e3cfd3065a9fa78452a27ddf9f"
+  },
+  "model": {
+    "repository": "madeby561/GLM-5.2-MXFP8-NVFP4-NF3-Hybrid",
+    "revision": "68babde27a97a4c980c2494e830dd424975cd5a3",
+    "metadata_sha256": {
+      "config.json": "254974797e9f455716a30ab5505ba68272181b20b58a3693e54f94fb8056f3ef",
+      "model.safetensors.index.json": "6eb773222d932418dd0530c63aca498f86ef424da2a4526ccba76b59726da234",
+      "tokenizer_config.json": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+      "mxfp8_tier_nokvb.json": "ebcd6087180033d4512fafa5f154f4fecfbc1ee5e5051448f34859cccc4430f0"
+    }
+  },
+  "runtime": {
+    "python": "3.12.3",
+    "pytorch": "2.12.0+cu132",
+    "cutlass_dsl": "4.6.0",
+    "quack_kernels": "0.6.1",
+    "pytest": "8.4.2",
+    "sparkinfer": "1.0.1",
+    "flashinfer": "0.6.15+cu132",
+    "nccl_python_package": "2.29.7",
+    "nccl_preload": "2.30.4"
+  },
+  "launch": {
+    "script": "serve-glm52-sparse-ckv.sh",
+    "sha256": "65de06284212a017f88a031798baa80f2be951c952c12fc0bb1ef0e97d7af024",
+    "allreduce_mode": "nccl",
+    "kv_cache_memory_bytes": 3426112942
+  },
+  "validated_host": {
+    "nvidia_driver": "610.43.02",
+    "docker": "29.6.1",
+    "docker_compose": "5.3.1"
+  }
+}
