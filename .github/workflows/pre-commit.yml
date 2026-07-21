@@ -65,8 +65,26 @@ jobs:
     - run: echo "::add-matcher::.github/workflows/matchers/markdownlint.json"
     - run: echo "::add-matcher::.github/workflows/matchers/mypy.json"
     - run: python -m pip install pre-commit
+    - name: Check changed shell scripts
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        mapfile -d '' shell_files < <(
+          git diff --name-only --diff-filter=ACMR -z \
+            "$BASE_SHA" "$HEAD_SHA" -- '*.sh'
+        )
+        if ((${#shell_files[@]})); then
+          shellcheck -s bash "${shell_files[@]}"
+        fi
     - name: Check pull request changes
       if: github.event_name == 'pull_request'
+      env:
+        # The repository hook scans every shell script and ignores the PR file
+        # list. The previous step preserves changed-file coverage on the fork.
+        SKIP: shellcheck
       run: >-
         pre-commit run --show-diff-on-failure --color=always
         --from-ref ${{ github.event.pull_request.base.sha }}
