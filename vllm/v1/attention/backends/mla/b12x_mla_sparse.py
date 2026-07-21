@@ -232,7 +232,7 @@ class _CKVPrefetchState:
         self.layer_caches: list[torch.Tensor | None] = []
         self.layer_impls: list[B12xMLASparseImpl | None] = []
         self.pending_layers: dict[int, _CKVPrefetchPendingLayer] = {}
-        self.sparse_decode_state: Any | None = None
+        self.sparse_decode_states: dict[int, Any] = {}
         self.gather_stream: torch.cuda.Stream | None = None
         self.ckv_workspace: torch.Tensor | None = None
         self.ckv_workspace_generation = 0
@@ -295,21 +295,24 @@ class _CKVPrefetchState:
         self.layer_impls[layer_idx] = impl
 
     def get_sparse_decode_state(self, layout, exchange):
-        if self.sparse_decode_state is None:
+        exchange_key = id(exchange)
+        sparse_decode_state = self.sparse_decode_states.get(exchange_key)
+        if sparse_decode_state is None:
             from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
                 SparseCKVDecodeState,
             )
 
-            self.sparse_decode_state = SparseCKVDecodeState(
+            sparse_decode_state = SparseCKVDecodeState(
                 layout=layout,
                 device=self.workspace_identity.device,
                 exchange=exchange,
             )
-        elif self.sparse_decode_state.layout != layout:
+            self.sparse_decode_states[exchange_key] = sparse_decode_state
+        elif sparse_decode_state.layout != layout:
             raise RuntimeError("sparse CKV layout changed within one execution lane")
-        elif self.sparse_decode_state.exchange is not exchange:
-            raise RuntimeError("sparse CKV exchange changed within one execution lane")
-        return self.sparse_decode_state
+        elif sparse_decode_state.exchange is not exchange:
+            raise RuntimeError("sparse CKV exchange identity was reused")
+        return sparse_decode_state
 
     def get_gather_stream(self) -> torch.cuda.Stream:
         if self.gather_stream is None:
