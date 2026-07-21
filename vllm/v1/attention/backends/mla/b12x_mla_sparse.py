@@ -28,6 +28,7 @@ ONE ``get_simultaneous`` call so they never alias.
 import inspect
 import os
 import weakref
+from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -232,7 +233,7 @@ class _CKVPrefetchState:
         self.layer_caches: list[torch.Tensor | None] = []
         self.layer_impls: list[B12xMLASparseImpl | None] = []
         self.pending_layers: dict[int, _CKVPrefetchPendingLayer] = {}
-        self.sparse_decode_states: dict[int, Any] = {}
+        self.sparse_decode_state: Any | None = None
         self.gather_stream: torch.cuda.Stream | None = None
         self.ckv_workspace: torch.Tensor | None = None
         self.ckv_workspace_generation = 0
@@ -295,24 +296,21 @@ class _CKVPrefetchState:
         self.layer_impls[layer_idx] = impl
 
     def get_sparse_decode_state(self, layout, exchange):
-        exchange_key = id(exchange)
-        sparse_decode_state = self.sparse_decode_states.get(exchange_key)
-        if sparse_decode_state is None:
+        if self.sparse_decode_state is None:
             from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
                 SparseCKVDecodeState,
             )
 
-            sparse_decode_state = SparseCKVDecodeState(
+            self.sparse_decode_state = SparseCKVDecodeState(
                 layout=layout,
                 device=self.workspace_identity.device,
                 exchange=exchange,
             )
-            self.sparse_decode_states[exchange_key] = sparse_decode_state
-        elif sparse_decode_state.layout != layout:
+        elif self.sparse_decode_state.layout != layout:
             raise RuntimeError("sparse CKV layout changed within one execution lane")
-        elif sparse_decode_state.exchange is not exchange:
-            raise RuntimeError("sparse CKV exchange identity was reused")
-        return sparse_decode_state
+        elif self.sparse_decode_state.exchange is not exchange:
+            raise RuntimeError("sparse CKV exchange changed within one execution lane")
+        return self.sparse_decode_state
 
     def get_gather_stream(self) -> torch.cuda.Stream:
         if self.gather_stream is None:
@@ -344,17 +342,22 @@ class _CKVPrefetchStateRegistry:
     """Builder-owned states partitioned by lane-scoped CKV workspace."""
 
     def __init__(self) -> None:
-        self.states: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
+        self.states: dict[
+            tuple[_CKVWorkspaceIdentity, Hashable | None], _CKVPrefetchState
+        ] = {}
 
-    def _retire(self, identities: list[_CKVWorkspaceIdentity]) -> None:
-        for identity in identities:
-            self.states.pop(identity).begin_step()
+    def _retire(
+        self,
+        keys: list[tuple[_CKVWorkspaceIdentity, Hashable | None]],
+    ) -> None:
+        for key in keys:
+            self.states.pop(key).begin_step()
 
     def _prune_released_workspaces(self) -> None:
         self._retire(
             [
-                identity
-                for identity, state in self.states.items()
+                key
+                for key, state in self.states.items()
                 if state.workspace_storage_ref() is None
             ]
         )
@@ -369,31 +372,37 @@ class _CKVPrefetchStateRegistry:
         workspace: torch.Tensor,
         layer_idx: int | None = None,
         kv_cache: torch.Tensor | None = None,
+        *,
+        execution_lane_key: Hashable | None = None,
     ) -> _CKVPrefetchState:
         self._prune_released_workspaces()
         identity = _ckv_workspace_identity(workspace)
-        state = self.states.get(identity)
+        registry_key = (identity, execution_lane_key)
+        state = self.states.get(registry_key)
         if state is None:
             # A resized view may retain its address, while an allocation
             # replacement changes it. A known layer cache identifies the same
             # execution lane across the latter without merging target/draft.
-            stale_identities = [
-                existing
-                for existing, existing_state in self.states.items()
-                if (
-                    existing.device == identity.device
-                    and existing.data_ptr == identity.data_ptr
-                )
-                or (
-                    layer_idx is not None
-                    and kv_cache is not None
-                    and layer_idx < len(existing_state.layer_caches)
-                    and existing_state.layer_caches[layer_idx] is kv_cache
+            stale_keys = [
+                existing_key
+                for existing_key, existing_state in self.states.items()
+                if existing_key[1] == execution_lane_key
+                and (
+                    (
+                        existing_key[0].device == identity.device
+                        and existing_key[0].data_ptr == identity.data_ptr
+                    )
+                    or (
+                        layer_idx is not None
+                        and kv_cache is not None
+                        and layer_idx < len(existing_state.layer_caches)
+                        and existing_state.layer_caches[layer_idx] is kv_cache
+                    )
                 )
             ]
-            self._retire(stale_identities)
+            self._retire(stale_keys)
             state = _CKVPrefetchState(identity, workspace)
-            self.states[identity] = state
+            self.states[registry_key] = state
         return state
 
 
@@ -1486,6 +1495,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             preload_dense_union_extension_consistently,
         )
 
+        model_type = str(
+            getattr(vllm_config.model_config.hf_config, "model_type", "target")
+        )
+        self._ckv_execution_lane_key = (model_type, id(vllm_config))
         sparse_decode_requested = envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER
         self._sparse_decode_enabled = sparse_decode_requested and (
             2 <= self.dcp_world_size <= 8
@@ -1533,14 +1546,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             if process_group is None:
                 raise RuntimeError("DCP CKV group has no device process group")
             preload_dense_union_extension_consistently(process_group, self.device)
-            model_type = str(
-                getattr(vllm_config.model_config.hf_config, "model_type", "target")
-            )
             self._sparse_decode_exchange = get_selected_record_exchange(
                 process_group=process_group,
                 device=self.device,
                 layout=self._sparse_decode_layout,
-                lane_key=(model_type, id(vllm_config)),
+                lane_key=self._ckv_execution_lane_key,
             )
         elif sparse_decode_requested:
             logger.warning_once(
@@ -2903,7 +2913,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 raise RuntimeError(
                     "selected-record CKV decode is missing its lane registry"
                 )
-            prefetch_state = registry.for_workspace(q_workspace, layer_idx, kv_cache)
+            prefetch_state = registry.for_workspace(
+                q_workspace,
+                layer_idx,
+                kv_cache,
+                execution_lane_key=self._ckv_execution_lane_key,
+            )
             if layer_idx is not None:
                 prefetch_state.enter_layer(layer_idx)
                 prefetch_state.register_cache(layer_idx, kv_cache)
@@ -3029,7 +3044,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             if prefetch_registry is None:
                 raise RuntimeError("CKV gather requires a prefetch state registry")
             prefetch_state = prefetch_registry.for_workspace(
-                q_workspace, layer_idx, kv_cache
+                q_workspace,
+                layer_idx,
+                kv_cache,
+                execution_lane_key=self._ckv_execution_lane_key,
             )
             ckv_workspace = prefetch_state.get_ckv_workspace(self._ckv_workspace_nbytes)
             if layer_idx is not None and self._ckv_prefetch_depth > 0:

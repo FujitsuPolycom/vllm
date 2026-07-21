@@ -10,11 +10,7 @@ import torch
 
 from vllm.distributed import parallel_state
 from vllm.v1.attention.backends.mla import b12x_sparse_ckv_decode
-from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
-    B12xMLASparseImpl,
-    _ckv_workspace_identity,
-    _CKVPrefetchState,
-)
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
     build_dense_union_remap,
     dense_union_remap_reference,
@@ -36,34 +32,6 @@ def _layout(*, dcp: int = 4, requests: int = 8, pool: int = 0):
         record_bytes=432,
         prefetch_depth=3,
     )
-
-
-def test_sparse_decode_state_isolated_for_target_and_draft_exchange(monkeypatch):
-    layout = _layout(requests=1)
-    workspace = torch.empty(1, dtype=torch.uint8)
-    prefetch_state = _CKVPrefetchState(_ckv_workspace_identity(workspace), workspace)
-    created = []
-
-    class State:
-        def __init__(self, *, layout, device, exchange):
-            self.layout = layout
-            self.device = device
-            self.exchange = exchange
-            created.append(self)
-
-    monkeypatch.setattr(b12x_sparse_ckv_decode, "SparseCKVDecodeState", State)
-    target_exchange = object()
-    draft_exchange = object()
-
-    target_state = prefetch_state.get_sparse_decode_state(layout, target_exchange)
-    draft_state = prefetch_state.get_sparse_decode_state(layout, draft_exchange)
-
-    assert target_state is not draft_state
-    assert (
-        prefetch_state.get_sparse_decode_state(layout, target_exchange) is target_state
-    )
-    assert prefetch_state.get_sparse_decode_state(layout, draft_exchange) is draft_state
-    assert created == [target_state, draft_state]
 
 
 def test_bulk_shared_prefetch_exchanges_three_layers_once_without_new_workspace():
