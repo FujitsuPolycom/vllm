@@ -28,7 +28,7 @@ VLLM_NVFP4_MLA_SCALES_FILE=/path/to/glm52-nvfp4-nf3-hybrid_mla_outer_scales_v1.j
 ## Results (teacher-forced prefill KLD vs BF16 reference, 5 fresh boots each)
 
 | KV config | mean +/- sd | max ctx (4x96GB) |
-|---|---|---|
+| --- | --- | --- |
 | fp8_ds_mla | 0.1263 +/- 0.0030 | 373k |
 | nvfp4_ds_mla + scales, bf16 rope | 0.1345 +/- 0.0035 | 550k |
 | nvfp4_ds_mla + scales, fp8 rope (`KV_FP8_ROPE=1`) | 0.1356 +/- 0.0054 | 600k+ |
