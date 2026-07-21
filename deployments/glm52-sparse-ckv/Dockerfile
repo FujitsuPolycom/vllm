@@ -4,9 +4,9 @@ FROM ${BASE_IMAGE} AS sources
 
 ARG VLLM_REPOSITORY=https://github.com/FujitsuPolycom/vllm.git
 ARG VLLM_BASE_REF=7ea567a2458a4800a6a0e3e0a6ba41fcbd00d146
-ARG VLLM_REF=a81a0811314e23bc6b2baa69f34247aacea71e23
+ARG VLLM_REF=5345ac2e922f9631f8e13eb13df692f89ea4422e
 ARG SPARKINFER_REPOSITORY=https://github.com/FujitsuPolycom/sparkinfer.git
-ARG SPARKINFER_REF=a82fc76f9a2321e3cfd3065a9fa78452a27ddf9f
+ARG SPARKINFER_REF=001443802832538289f8032cb0d60bfe5ef8f468
 
 USER root
 
@@ -22,7 +22,7 @@ RUN set -eux; \
           mkdir -p "/src/vllm-overlay/$(dirname "${path}")"; \
           cp "/src/vllm/${path}" "/src/vllm-overlay/${path}"; \
         done; \
-    test "$(find /src/vllm-overlay/vllm -type f | wc -l)" = "39"; \
+    test "$(find /src/vllm-overlay/vllm -type f | wc -l)" = "33"; \
     git clone --filter=blob:none "${SPARKINFER_REPOSITORY}" /src/sparkinfer; \
     git -C /src/sparkinfer checkout --detach "${SPARKINFER_REF}"; \
     test "$(git -C /src/sparkinfer rev-parse HEAD)" = "${SPARKINFER_REF}"; \
@@ -31,8 +31,8 @@ RUN set -eux; \
 
 FROM ${BASE_IMAGE}
 
-ARG VLLM_REF=a81a0811314e23bc6b2baa69f34247aacea71e23
-ARG SPARKINFER_REF=a82fc76f9a2321e3cfd3065a9fa78452a27ddf9f
+ARG VLLM_REF=5345ac2e922f9631f8e13eb13df692f89ea4422e
+ARG SPARKINFER_REF=001443802832538289f8032cb0d60bfe5ef8f468
 ARG RUN_CPU_TESTS=1
 
 USER root
@@ -85,7 +85,7 @@ RUN set -eux; \
         /opt/release-tests/vllm-tests/v1/attention/test_b12x_sparse_ckv_decode_policy.py \
         /opt/release-tests/vllm-tests/v1/attention/test_b12x_ckv_prefetch_policy.py \
         /opt/release-tests/vllm-tests/v1/attention/test_indexer_dcp_localize.py \
-        /opt/release-tests/vllm-tests/v1/worker/test_workspace.py; \
+        /opt/release-tests/vllm-tests/v1/attention/test_b12x_mla_dcp_workspace.py; \
       python -m pytest -q -p no:cacheprovider \
         /opt/release-tests/vllm-tests/v1/core/test_kv_cache_utils.py \
         -k 'lockstep_mla or mixed_dcp_replicated_groups'; \

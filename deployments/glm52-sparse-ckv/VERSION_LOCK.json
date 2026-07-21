@@ -1,5 +1,5 @@
 {
-  "release": "glm52-sparse-ckv-v19-20260721",
+  "release": "glm52-sparse-ckv-latest-upstream-20260721",
   "base_image": {
     "repository": "voipmonitor/vllm",
     "tag_used_during_validation": "gilded-gnosis-v19-vllm7ea567a-b12x4cfa530-fi801d57a-cu132-20260718",
@@ -7,14 +7,15 @@
   },
   "vllm": {
     "repository": "https://github.com/FujitsuPolycom/vllm.git",
-    "branch": "codex/sparse-ckv-bulk-prefetch",
+    "branch": "codex/glm52-sparse-ckv-integration-20260721",
     "base_image_source_commit": "7ea567a2458a4800a6a0e3e0a6ba41fcbd00d146",
-    "commit": "a81a0811314e23bc6b2baa69f34247aacea71e23"
+    "upstream_base_commit": "6a2edcf1707694daf36ceb8433a8240f86943fb7",
+    "commit": "5345ac2e922f9631f8e13eb13df692f89ea4422e"
   },
   "sparkinfer": {
     "repository": "https://github.com/FujitsuPolycom/sparkinfer.git",
-    "branch": "codex/sparse-ckv-release-20260721",
-    "commit": "a82fc76f9a2321e3cfd3065a9fa78452a27ddf9f"
+    "branch": "codex/sparse-ckv-integration-20260721",
+    "commit": "001443802832538289f8032cb0d60bfe5ef8f468"
   },
   "model": {
     "repository": "madeby561/GLM-5.2-MXFP8-NVFP4-NF3-Hybrid",
