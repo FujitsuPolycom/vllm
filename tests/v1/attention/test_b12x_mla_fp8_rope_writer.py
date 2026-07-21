@@ -24,6 +24,14 @@ class _WriterInitializationFailure(RuntimeError):
     pass
 
 
+class _FakePackageModule(types.ModuleType):
+    __path__: list[str]
+    attention: types.ModuleType
+    _shared: types.ModuleType
+    mla: types.ModuleType
+    kv_cache: types.ModuleType
+
+
 def _initialize_writer_seam(
     impl: B12xMLASparseImpl,
     *,
@@ -75,20 +83,20 @@ def _install_fake_writer_package(
     monkeypatch: pytest.MonkeyPatch,
     writer,
 ) -> None:
-    sparkinfer_module = types.ModuleType("sparkinfer")
+    sparkinfer_module = _FakePackageModule("sparkinfer")
     sparkinfer_module.__path__ = []
-    attention_module = types.ModuleType("sparkinfer.attention")
+    attention_module = _FakePackageModule("sparkinfer.attention")
     attention_module.__path__ = []
-    shared_module = types.ModuleType("sparkinfer.attention._shared")
+    shared_module = _FakePackageModule("sparkinfer.attention._shared")
     shared_module.__path__ = []
-    mla_module = types.ModuleType("sparkinfer.attention._shared.mla")
+    mla_module = _FakePackageModule("sparkinfer.attention._shared.mla")
     mla_module.__path__ = []
     kv_cache_module = types.ModuleType(_WRITER_MODULE)
 
-    setattr(sparkinfer_module, "attention", attention_module)
-    setattr(attention_module, "_shared", shared_module)
-    setattr(shared_module, "mla", mla_module)
-    setattr(mla_module, "kv_cache", kv_cache_module)
+    sparkinfer_module.attention = attention_module
+    attention_module._shared = shared_module
+    shared_module.mla = mla_module
+    mla_module.kv_cache = kv_cache_module
     if writer is not None:
         setattr(kv_cache_module, _WRITER_NAME, writer)
 
