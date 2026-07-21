@@ -10,7 +10,7 @@
     "branch": "codex/glm52-sparse-ckv-integration-20260721",
     "base_image_source_commit": "7ea567a2458a4800a6a0e3e0a6ba41fcbd00d146",
     "upstream_base_commit": "6a2edcf1707694daf36ceb8433a8240f86943fb7",
-    "commit": "5345ac2e922f9631f8e13eb13df692f89ea4422e"
+    "commit": "bcfdd259fc37907ad06ed908405ae9101d8e2d97"
   },
   "sparkinfer": {
     "repository": "https://github.com/FujitsuPolycom/sparkinfer.git",
