@@ -176,6 +176,12 @@ class SchedulerStats:
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
 
+    # Fresh prompt tokens issued to the model in the current scheduler step.
+    # This excludes prefix-cache and external-KV tokens, and is intentionally
+    # separate from request-level prompt accounting, which may be reported only
+    # when a request produces its first output.
+    prefill_tokens_scheduled: int = 0
+
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0

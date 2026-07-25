@@ -100,6 +100,7 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
     # Verify all requests are scheduled.
     for req_id, num_tokens in output.num_scheduled_tokens.items():
         assert num_tokens == len(requests[int(req_id)].prompt_token_ids)
+    assert output.prefill_tokens_scheduled == output.total_num_scheduled_tokens
 
     # Verify requests moved from waiting to running
     assert len(scheduler.waiting) == 0
@@ -867,6 +868,12 @@ def test_schedule_concurrent_batches(
     # The first request is still running, so only schedule the second request.
     scheduler.add_request(requests[1])
     scheduler_output1 = scheduler.schedule()
+
+    # Initial scheduling is all fresh prompt work, including when the prompt
+    # is split across multiple chunked-prefill steps.
+    assert scheduler_output1.prefill_tokens_scheduled == (
+        scheduler_output1.total_num_scheduled_tokens
+    )
     assert len(scheduler_output1.scheduled_new_reqs) == 1
     assert scheduler_output1.num_scheduled_tokens[requests[1].request_id] == 512
 

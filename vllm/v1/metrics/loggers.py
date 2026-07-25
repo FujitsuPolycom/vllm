@@ -639,6 +639,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_prompt_tokens, per_engine_labelvalues
         )
 
+        counter_prefill_tokens_scheduled = self._counter_cls(
+            name="vllm:prefill_tokens_scheduled",
+            documentation=(
+                "Fresh prompt tokens issued by the scheduler for local prefill. "
+                "Excludes prefix-cache and external-KV tokens."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_prefill_tokens_scheduled = create_metric_per_engine(
+            counter_prefill_tokens_scheduled, per_engine_labelvalues
+        )
+
         # Labeled prompt token counters by source
         counter_prompt_tokens_by_source = self._counter_cls(
             name="vllm:prompt_tokens_by_source",
@@ -1069,6 +1081,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
     ):
         """Log to prometheus."""
         if scheduler_stats is not None:
+            self.counter_prefill_tokens_scheduled[engine_idx].inc(
+                scheduler_stats.prefill_tokens_scheduled
+            )
             self.gauge_scheduler_running[engine_idx].set(
                 scheduler_stats.num_running_reqs
             )
