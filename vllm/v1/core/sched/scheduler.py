@@ -425,6 +425,7 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
+        prefill_tokens_scheduled = 0
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -584,6 +585,13 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            prefill_tokens_scheduled += max(
+                0,
+                min(
+                    num_new_tokens,
+                    request.num_prompt_tokens - request.num_computed_tokens,
+                ),
+            )
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -986,6 +994,13 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                prefill_tokens_scheduled += max(
+                    0,
+                    min(
+                        num_new_tokens,
+                        request.num_prompt_tokens - num_computed_tokens,
+                    ),
+                )
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -1097,6 +1112,7 @@ class Scheduler(SchedulerInterface):
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            prefill_tokens_scheduled=prefill_tokens_scheduled,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
@@ -1844,7 +1860,11 @@ class Scheduler(SchedulerInterface):
 
         if (
             stats := self.make_stats(
-                spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
+                spec_decoding_stats,
+                kv_connector_stats,
+                cudagraph_stats,
+                perf_stats,
+                scheduler_output.prefill_tokens_scheduled,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2285,6 +2305,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        prefill_tokens_scheduled: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -2307,6 +2328,7 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
+            prefill_tokens_scheduled=prefill_tokens_scheduled,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

@@ -194,6 +194,9 @@ class SchedulerOutput:
     # Total number of tokens scheduled for all requests.
     # Equal to sum(num_scheduled_tokens.values())
     total_num_scheduled_tokens: int
+    # Fresh prompt tokens issued in this scheduler step. Prefix-cache and
+    # external-KV tokens are excluded.
+    prefill_tokens_scheduled: int
     # req_id -> spec_token_ids
     # If a request does not have any spec decode tokens, it will not be
     # included in the dictionary.
@@ -251,6 +254,7 @@ class SchedulerOutput:
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
+            prefill_tokens_scheduled=0,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],

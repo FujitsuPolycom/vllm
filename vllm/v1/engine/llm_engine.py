@@ -322,7 +322,6 @@ class LLMEngine:
             if (
                 self.logger_manager is not None
                 and outputs.scheduler_stats is not None
-                and len(outputs.outputs) > 0
             ):
                 self.logger_manager.record(
                     scheduler_stats=outputs.scheduler_stats,
