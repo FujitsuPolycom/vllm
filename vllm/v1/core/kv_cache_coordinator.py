@@ -220,11 +220,6 @@ class KVCacheCoordinator(ABC):
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
         """
-        if self.lockstep_mla_allocations and num_external_computed_tokens:
-            raise NotImplementedError(
-                "External KV loads are not supported with lockstep MLA allocations."
-            )
-
         # A running request is already tracked in num_cached_block and won't
         # have new prefix-cache hits, so this is a no-op for it.
         if any(
@@ -246,12 +241,38 @@ class KVCacheCoordinator(ABC):
                 num_external_computed_tokens,
             )
         if num_external_computed_tokens > 0:
-            for manager in self.single_type_managers:
-                manager.allocate_external_computed_blocks(
+            if not self.lockstep_mla_allocations:
+                for manager in self.single_type_managers:
+                    manager.allocate_external_computed_blocks(
+                        request_id,
+                        num_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+            else:
+                managers = self.single_type_managers
+                assert all(
+                    manager.block_size == managers[0].block_size
+                    for manager in managers[1:]
+                ), "Lockstep MLA managers must use one effective block size"
+
+                # Every lockstep group is MLA (i.e. full attention), so no group
+                # skips tokens and every manager would allocate the same blocks.
+                # Allocate each physical destination block exactly once: the
+                # connector loads every logical KV group into the same block
+                # index, but into that group's distinct KV tensors.
+                old_len = len(managers[0].req_to_blocks[request_id])
+                managers[0].allocate_external_computed_blocks(
                     request_id,
                     num_local_computed_tokens,
                     num_external_computed_tokens,
                 )
+                shared_external_blocks = managers[0].req_to_blocks[request_id][old_len:]
+
+                # One request reference is required per logical manager. The
+                # primary allocation owns the first; touch once for each peer.
+                for manager in managers[1:]:
+                    self.block_pool.touch(shared_external_blocks)
+                    manager.req_to_blocks[request_id].extend(shared_external_blocks)
 
         if self.lockstep_mla_allocations:
             group_blocks = [
@@ -799,10 +820,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                   sparse-retention group has not cached yet (0 unless hybrid).
         """
         if self.disable_prefix_cache_for_dcp_hybrid:
-            blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            empty_blocks: tuple[list[KVCacheBlock], ...] = tuple(
                 [] for _ in range(len(self.kv_cache_config.kv_cache_groups))
             )
-            return blocks, 0, 0
+            return empty_blocks, 0, 0
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
