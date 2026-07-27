@@ -399,6 +399,45 @@ def test_offloading_spec_resolves_prefill_context_parallel_block_sizes():
     assert spec.blocks_per_chunk == 2
 
 
+def test_offloading_config_does_not_cp_scale_replicated_groups():
+    config = _make_layout_vllm_config(
+        tensor_parallel_size=4,
+        decode_context_parallel_size=4,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=432,
+                    dtype=torch.uint8,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["indexer"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert tuple(group.tokens_per_block for group in offloading_config.groups) == (
+        64,
+        64,
+    )
+
+
 def test_offloading_config_preserves_data_parallel_index():
     config = _make_layout_vllm_config()
     config.parallel_config.data_parallel_index = 2
