@@ -356,18 +356,21 @@ def test_lockstep_mla_partial_prefix_hit_mirrors_single_cow_block():
     assert manager.block_pool.blocks[cow_block_id].ref_cnt == 2
 
 
-def test_lockstep_mla_rejects_external_computed_blocks():
+def test_lockstep_mla_allocates_external_computed_blocks_once():
     manager = make_lockstep_mla_manager()
 
-    with pytest.raises(NotImplementedError, match="External KV loads"):
-        manager.coordinator.allocate_new_computed_blocks(
-            "external",
-            ([], []),
-            num_local_computed_tokens=0,
-            num_external_computed_tokens=256,
-        )
+    manager.coordinator.allocate_new_computed_blocks(
+        "external",
+        ([], []),
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=256,
+    )
 
-    assert manager.get_block_ids("external") == ([], [])
+    target_ids, indexer_ids = manager.get_block_ids("external")
+    assert len(target_ids) == 1
+    assert target_ids == indexer_ids
+    assert manager.block_pool.get_num_free_blocks() == 3
+    assert manager.block_pool.blocks[target_ids[0]].ref_cnt == 2
 
 
 def test_lockstep_group_hashes_promote_partial_block_together():
