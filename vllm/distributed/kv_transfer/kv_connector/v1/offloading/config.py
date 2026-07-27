@@ -16,7 +16,7 @@ from vllm.v1.kv_offload.config import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor
 
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
@@ -40,9 +40,23 @@ def build_offloading_config(
         parallel_config.decode_context_parallel_size
         * parallel_config.prefill_context_parallel_size
     )
+
+    def _tokens_per_block(kv_cache_spec: "KVCacheSpec") -> int:
+        # Must match `SingleTypeKVCacheManager.__init__`'s effective block size,
+        # since the offloading key and chunk math indexes the same scheduler
+        # blocks. Under (D)CP a sharded group's local block covers
+        # `block_size * cp` tokens of the global sequence, but a
+        # `dcp_replicated` group keeps the full cache on every rank, so one of
+        # its blocks covers exactly `block_size` global tokens and must not be
+        # scaled. Mixed sharded/replicated groups occur with lockstep MLA (an
+        # MLA cache plus a replicated sparse-indexer cache).
+        if getattr(kv_cache_spec, "dcp_replicated", False):
+            return kv_cache_spec.block_size
+        return kv_cache_spec.block_size * context_parallel_factor
+
     groups = tuple(
         OffloadingGroupConfig(
-            tokens_per_block=(group.kv_cache_spec.block_size * context_parallel_factor),
+            tokens_per_block=_tokens_per_block(group.kv_cache_spec),
             layer_names=tuple(group.layer_names),
         )
         for group in kv_cache_config.kv_cache_groups
