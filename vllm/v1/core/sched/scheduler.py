@@ -732,6 +732,7 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    hit_diverged = False
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
@@ -740,35 +741,73 @@ class Scheduler(SchedulerInterface):
                             self.kv_cache_manager.coordinator,
                             HybridKVCacheCoordinator,
                         )
+                        # Full attention is downward-closed, so per-group
+                        # divergence is only resolvable against an FA
+                        # reference group (vLLM #48425 / #46453 port).
+                        and self.kv_cache_manager.coordinator.full_attention_group_id
+                        is not None
                     ):
+                        coordinator = self.kv_cache_manager.coordinator
                         computed, per_group_hits = (
-                            self.kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
+                            coordinator.find_longest_cache_hit_per_group(
                                 request.block_hashes, request.num_tokens - 1
                             )
                         )
-                        new_computed_blocks = (
-                            self.kv_cache_manager.create_kv_cache_blocks(computed)
-                        )
-                        # NOTE(ZhanqiuHu): For Mamba hybrid models,
-                        # num_new_local_computed_tokens should be the FA hit
-                        # length. This value is passed to the connector's
-                        # get_num_new_matched_tokens which computes:
-                        # external = total - local_computed.
-                        # Using the FA hit skips re-transferring FA blocks
-                        # already cached on D-side. The Mamba state (always
-                        # the last block) is transferred unconditionally by
-                        # _apply_prefix_caching in nixl/worker.py.
-                        num_new_local_computed_tokens = max(per_group_hits)
-                        # The per-group lookup does not detect an uncached shared
-                        # prefix, so there is no junction to pin in this path.
-                        request.shared_prefix_boundary = 0
-                        if self.kv_cache_manager.log_stats:
-                            assert self.kv_cache_manager.prefix_cache_stats is not None
-                            self.kv_cache_manager.prefix_cache_stats.record(
-                                num_tokens=request.num_tokens,
-                                num_hits=num_new_local_computed_tokens,
-                                preempted=request.num_preemptions > 0,
+                        fa_group_id = coordinator.full_attention_group_id
+                        if any(
+                            hit > per_group_hits[fa_group_id]
+                            for hit in per_group_hits
+                        ):
+                            # A lagging group hit deeper than full attention
+                            # means FA blocks were evicted; use the reconciled
+                            # boundary every group agrees on (#48425 port).
+                            (
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                request.shared_prefix_boundary,
+                            ) = self.kv_cache_manager.get_computed_blocks(request)
+                        else:
+                            new_computed_blocks = (
+                                self.kv_cache_manager.create_kv_cache_blocks(
+                                    computed
+                                )
                             )
+                            # NOTE(ZhanqiuHu): For Mamba hybrid models,
+                            # num_new_local_computed_tokens should be the FA hit
+                            # length. This value is passed to the connector's
+                            # get_num_new_matched_tokens which computes:
+                            # external = total - local_computed.
+                            # Using the FA hit skips re-transferring FA blocks
+                            # already cached on D-side. The Mamba state (always
+                            # the last block) is transferred unconditionally by
+                            # _apply_prefix_caching in nixl/worker.py.
+                            num_new_local_computed_tokens = per_group_hits[
+                                fa_group_id
+                            ]
+                            # The per-group lookup does not detect an uncached
+                            # shared prefix, so there is no junction to pin in
+                            # this path.
+                            request.shared_prefix_boundary = 0
+                            # An FA hit deeper than a lagging group only has a
+                            # valid Mamba state at its boundary if the connector
+                            # supplies it; flag so the ext==0 case reconciles
+                            # below (#48425 port).
+                            hit_diverged = (
+                                min(per_group_hits)
+                                < num_new_local_computed_tokens
+                            )
+                            # get_computed_blocks records stats internally, so
+                            # only the per-group path records here.
+                            if self.kv_cache_manager.log_stats:
+                                assert (
+                                    self.kv_cache_manager.prefix_cache_stats
+                                    is not None
+                                )
+                                self.kv_cache_manager.prefix_cache_stats.record(
+                                    num_tokens=request.num_tokens,
+                                    num_hits=num_new_local_computed_tokens,
+                                    preempted=request.num_preemptions > 0,
+                                )
                     else:
                         (
                             new_computed_blocks,
@@ -807,6 +846,17 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+
+                        if hit_diverged and num_external_computed_tokens == 0:
+                            # No external tokens back the deeper local hit, so
+                            # its resume boundary would have no valid Mamba
+                            # state. Reconcile to the boundary every group
+                            # agrees on (vLLM #48425 / #46453 port).
+                            (
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                request.shared_prefix_boundary,
+                            ) = self.kv_cache_manager.get_computed_blocks(request)
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
