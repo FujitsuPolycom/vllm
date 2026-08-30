@@ -210,6 +210,25 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     @property
+    def supports_recurrent_boundary_blocks(self) -> bool:
+        return any(c.supports_recurrent_boundary_blocks for c in self._connectors)
+
+    def get_recurrent_publication_boundaries(
+        self, request: "Request"
+    ) -> tuple[int, ...]:
+        return tuple(
+            sorted(
+                {
+                    boundary
+                    for connector in self._connectors
+                    for boundary in connector.get_recurrent_publication_boundaries(
+                        request
+                    )
+                }
+            )
+        )
+
+    @property
     def requires_kv_delivery(self) -> bool:
         return any(c.requires_kv_delivery for c in self._connectors)
 

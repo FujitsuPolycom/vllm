@@ -183,6 +183,19 @@ class KVConnectorBase_V1(ABC):
         return False
 
     @property
+    def supports_recurrent_boundary_blocks(self) -> bool:
+        """Whether this connector consumes exact recurrent-boundary blocks."""
+
+        return False
+
+    def get_recurrent_publication_boundaries(
+        self, request: "Request"
+    ) -> tuple[int, ...]:
+        """Return side-effect-free connector publication targets for a request."""
+
+        return ()
+
+    @property
     def requires_kv_delivery(self) -> bool:
         """Whether this connector hands off KV that must be reliably delivered.
 

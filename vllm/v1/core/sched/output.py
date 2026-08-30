@@ -280,6 +280,13 @@ class SchedulerOutput:
     # tail (mamba "align" CoW target). None unless partial hash hits are active.
     partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None = None
 
+    # Hash-proven recurrent-state blocks for external KV connectors:
+    # {request_id: [(group_id, block_id, boundary_tokens), ...]}. The union
+    # includes full aligned Mamba pages and the partial-tail CoW targets above.
+    # Consumers opting into aligned boundaries must finish their worker-side
+    # snapshot before request cleanup releases the scheduler pin.
+    recurrent_boundary_blocks: dict[str, list[tuple[int, int, int]]] | None = None
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int | None = None

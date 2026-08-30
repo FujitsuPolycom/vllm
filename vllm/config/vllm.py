@@ -1070,6 +1070,15 @@ class VllmConfig:
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
             return
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.kv_connector == "SparkContextCacheConnector"
+        ):
+            # SparkContextCacheConnector does not register GPU virtual addresses
+            # with an external transport. Stores copy tensors to host memory and
+            # restores write through torch indexing, so expandable-segment remaps
+            # cannot stale an external memory registration.
+            return
 
         raise ValueError(
             f"KV connector {self.kv_transfer_config.kv_connector} is "

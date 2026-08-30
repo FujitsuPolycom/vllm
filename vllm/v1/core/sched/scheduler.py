@@ -165,7 +165,12 @@ class Scheduler(SchedulerInterface):
             # Connector can reallocate and fill those blocks via a load that
             # isn't ordered against that write, so defer freeing them.
             multiple_inflight_batches = self.vllm_config.max_concurrent_batches > 1
-            if multiple_inflight_batches and kv_transfer_config.is_kv_consumer:
+            if multiple_inflight_batches and (
+                kv_transfer_config.is_kv_consumer
+                or bool(
+                    getattr(self.connector, "supports_recurrent_boundary_blocks", False)
+                )
+            ):
                 self.defer_block_free = True
 
             self.requires_kv_delivery = self.connector.requires_kv_delivery
@@ -218,6 +223,9 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # lease_key -> (leader request id, non-empty scheduler step whose
+        # worker completion proves every dedicated partial-page copy ran)
+        self._pending_shared_prefix_leases: dict[str, tuple[str, int]] = {}
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -416,6 +424,32 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    def _recurrent_publication_boundaries(self, request: Request) -> tuple[int, ...]:
+        connector = self.connector
+        if connector is None:
+            return ()
+        boundaries = connector.get_recurrent_publication_boundaries(request)
+        if not isinstance(boundaries, (list, tuple)):
+            raise ValueError("recurrent publication boundaries must be a sequence")
+        normalized = tuple(sorted(set(boundaries)))
+        if any(
+            type(boundary) is not int
+            or boundary <= 0
+            or boundary >= request.num_prompt_tokens
+            or boundary % self.hash_block_size != 0
+            for boundary in normalized
+        ):
+            raise ValueError(
+                "recurrent publication boundaries must be positive internal-hash"
+                " multiples below the prompt length"
+            )
+        return normalized
+
+    def _recurrent_publication_boundary_at(
+        self, request: Request, end: int
+    ) -> int | None:
+        return end if end in self._recurrent_publication_boundaries(request) else None
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -489,6 +523,14 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        boundary_proposer = getattr(self, "_recurrent_publication_boundaries", None)
+        publication_boundaries = (
+            boundary_proposer(request) if boundary_proposer is not None else ()
+        )
+        publication_boundary = min(
+            (boundary for boundary in publication_boundaries if start < boundary < end),
+            default=0,
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -500,6 +542,9 @@ class Scheduler(SchedulerInterface):
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
+            # Connector publication uses its own wire-identity boundary while
+            # native prefix-cache hashes retain hash_block_size.
+            publication_boundary,
             # Marconi shared-prefix junction, block-floored (a sub-block
             # junction's state is not separately cacheable): cache its state
             # so sibling requests sharing the prefix can reuse it.
@@ -584,6 +629,10 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        # Shared-prefix leases are optional, bounded cache work.  Expiring
+        # them is O(2) and releases only the scheduler-owned pin; requests
+        # already attached to those blocks keep their ordinary references.
+        self.kv_cache_manager.expire_shared_prefix_leases()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -698,11 +747,18 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                recurrent_publication_boundary = (
+                    self._recurrent_publication_boundary_at(
+                        request,
+                        request.num_computed_tokens + num_new_tokens,
+                    )
+                )
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        recurrent_publication_boundary=(recurrent_publication_boundary),
                     )
 
                     if new_blocks is not None:
@@ -877,6 +933,47 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+
+                # A connector may offer an exact block-table lease after a
+                # prior async restore completed on every worker.  Attach it
+                # before hash lookup: hybrid Mamba/EAGLE tables are not always
+                # rediscoverable as an ordinary local prefix hit even though
+                # the verified blocks are still resident.
+                if request.num_computed_tokens == 0 and self.connector is not None:
+                    get_lease = getattr(
+                        self.connector, "get_shared_prefix_lease_candidate", None
+                    )
+                    candidate = get_lease(request) if get_lease is not None else None
+                    if candidate is not None:
+                        lease_key, lease_tokens = candidate
+                        attached_tokens = 0
+                        if 0 < lease_tokens <= request.num_tokens:
+                            attached_tokens = (
+                                self.kv_cache_manager.attach_shared_prefix_lease(
+                                    lease_key, request_id
+                                )
+                            )
+                        if attached_tokens:
+                            # Preserve vLLM's full-hit rule: the final prompt
+                            # token is recomputed to produce sampling logits.
+                            request.num_computed_tokens = min(
+                                attached_tokens, request.num_tokens - 1
+                            )
+                            attached = getattr(
+                                self.connector,
+                                "shared_prefix_lease_attached",
+                                None,
+                            )
+                            if attached is not None:
+                                attached(request_id, lease_key)
+                        else:
+                            rejected = getattr(
+                                self.connector,
+                                "shared_prefix_lease_rejected",
+                                None,
+                            )
+                            if rejected is not None:
+                                rejected(request_id, lease_key)
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -1117,6 +1214,12 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    recurrent_publication_boundary=(
+                        self._recurrent_publication_boundary_at(
+                            request,
+                            num_computed_tokens + num_new_tokens,
+                        )
+                    ),
                 )
 
                 if new_blocks is None:
@@ -1311,6 +1414,7 @@ class Scheduler(SchedulerInterface):
         # pin); the manager drops stale entries when the request's blocks are
         # popped for free.
         pending_partial_tail_offloads = None
+        pending_recurrent_boundary_blocks = None
         if (
             self.connector is not None
             and self.vllm_config.kv_transfer_config is not None
@@ -1319,6 +1423,19 @@ class Scheduler(SchedulerInterface):
             pending_partial_tail_offloads = (
                 self.kv_cache_manager.take_partial_tail_offloads() or None
             )
+            if bool(
+                getattr(self.connector, "supports_recurrent_boundary_blocks", False)
+            ):
+                # Opting in requires the connector's worker snapshot to finish
+                # before request cleanup releases the boundary pins.
+                pending_recurrent_boundary_blocks = (
+                    self.kv_cache_manager.take_recurrent_boundary_blocks(
+                        pending_partial_tail_offloads
+                    )
+                    or None
+                )
+            else:
+                self.kv_cache_manager.discard_aligned_recurrent_boundaries()
 
         kv_cache_block_copies, cow_retained_blocks = (
             self.kv_cache_manager.take_kv_cache_block_copies()
@@ -1371,6 +1488,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
+            recurrent_boundary_blocks=pending_recurrent_boundary_blocks,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
@@ -1392,7 +1510,7 @@ class Scheduler(SchedulerInterface):
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
+        if total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
@@ -1832,9 +1950,11 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+        if scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
-            self._drain_deferred_frees()
+            if self.defer_block_free:
+                self._drain_deferred_frees()
+            self._finalize_shared_prefix_leases()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -2907,12 +3027,63 @@ class Scheduler(SchedulerInterface):
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
+            # Publication is deliberately after both the all-worker receive
+            # completion and cache_blocks().  A connector can now name this
+            # exact verified prefix for bounded by-reference sharing.
+            publish = getattr(
+                self.connector, "get_shared_prefix_lease_to_publish", None
+            )
+            lease = publish(request) if publish is not None else None
+            if lease is not None:
+                lease_key, lease_tokens, ttl_seconds = lease
+                published = self.kv_cache_manager.publish_shared_prefix_lease(
+                    lease_key,
+                    request.request_id,
+                    lease_tokens,
+                    ttl_seconds,
+                    max_entries=2,
+                    reserved_blocks=self._request_remaining_blocks(request),
+                )
+                if published:
+                    self._pending_shared_prefix_leases[lease_key] = (
+                        request.request_id,
+                        self.sched_step_seq + 1,
+                    )
+                else:
+                    callback = getattr(
+                        self.connector, "shared_prefix_lease_rejected", None
+                    )
+                    if callback is not None:
+                        callback(request.request_id, lease_key)
+
             # on a full prompt hit, we need to re-compute the last token
             # in order to be able to sample the next token
             if request.num_computed_tokens == request.num_tokens:
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
+
+    def _finalize_shared_prefix_leases(self) -> None:
+        """Make copied hot pages attachable only after worker completion."""
+        connector = self.connector
+        for lease_key, (request_id, fence_step) in tuple(
+            self._pending_shared_prefix_leases.items()
+        ):
+            if fence_step > self.processed_step_seq:
+                continue
+            self._pending_shared_prefix_leases.pop(lease_key, None)
+            ready = self.kv_cache_manager.mark_shared_prefix_lease_ready(lease_key)
+            accepted = False
+            if ready and connector is not None:
+                callback = getattr(connector, "shared_prefix_lease_published", None)
+                if callback is not None:
+                    accepted = callback(request_id, lease_key) is not False
+            if not ready or not accepted:
+                self.kv_cache_manager.discard_shared_prefix_lease(lease_key)
+                if connector is not None:
+                    callback = getattr(connector, "shared_prefix_lease_rejected", None)
+                    if callback is not None:
+                        callback(request_id, lease_key)
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
@@ -3021,13 +3192,31 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
-            # We iterate only over blocks that may contain externally computed
-            # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+            req_block_groups = self.kv_cache_manager.get_block_ids(req_id)
+            if len(req_block_groups) != 1:
+                request_block_ids = {
+                    block_id
+                    for group_block_ids in req_block_groups
+                    for block_id in group_block_ids
+                }
+                if request_block_ids.isdisjoint(invalid_block_ids):
+                    continue
+                # SparkCache restores every HMA group as one verified
+                # transaction. A failure in any group invalidates the whole
+                # external prefix, so restart this request from token zero.
+                affected_req_ids.add(req_id)
+                total_affected_tokens += req_num_computed_tokens
+                request.num_computed_tokens = 0
+                if evict_blocks:
+                    blocks_to_evict.update(request_block_ids)
+                continue
+
+            (req_block_ids,) = req_block_groups
+            # We iterate only over blocks that may contain externally computed
+            # tokens
 
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
