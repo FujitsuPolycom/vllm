@@ -151,10 +151,11 @@ class TestRedactSensitiveArgs:
             api_utils.log_non_default_args(args=Namespace())
         message = caplog.text
         assert self.API_KEY not in message
-        assert "'api_key': '***'" in message
-        # non-sensitive args are still logged
+        assert "api_key" not in message
         assert "org/model" in message
         assert "qwen3_coder" in message
+        assert "default_chat_template_kwargs" not in message
+        assert "serving config" in message
 
     def test_hf_token_not_in_log(self, monkeypatch, caplog):
         hf_token = "hf_TESTTOKENVALUE123"
@@ -168,5 +169,5 @@ class TestRedactSensitiveArgs:
             api_utils.log_non_default_args(args=Namespace())
         message = caplog.text
         assert hf_token not in message
-        assert "'hf_token': '***'" in message
+        assert "hf_token" not in message
         assert "org/model" in message

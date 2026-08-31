@@ -283,7 +283,32 @@ def redact_sensitive_args(args: dict[str, Any]) -> dict[str, Any]:
 
 def log_non_default_args(args: Namespace | EngineArgs):
     non_default_args = get_non_default_args(args)
-    logger.info("non-default args: %s", redact_sensitive_args(non_default_args))
+    redacted = redact_sensitive_args(non_default_args)
+    summary_fields = (
+        "model_tag",
+        "served_model_name",
+        "port",
+        "tensor_parallel_size",
+        "decode_context_parallel_size",
+        "max_model_len",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "kv_cache_dtype",
+        "load_format",
+        "attention_backend",
+        "moe_backend",
+        "linear_backend",
+        "tool_call_parser",
+        "reasoning_parser",
+        "enable_auto_tool_choice",
+    )
+    summary = {key: redacted[key] for key in summary_fields if key in redacted}
+    speculative = redacted.get("speculative_config")
+    if isinstance(speculative, dict):
+        summary["speculative_method"] = speculative.get("method")
+        summary["speculative_tokens"] = speculative.get("num_speculative_tokens")
+    logger.info("serving config: %s", summary)
+    logger.debug("non-default args: %s", redacted)
 
 
 def should_include_usage(

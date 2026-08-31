@@ -629,6 +629,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),
+    # GLM-5.3 keeps target attention and recurrent-state page sizes independent.
+    # The platform validates the values before constructing cache groups.
+    "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE": lambda: os.getenv(
+        "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE"
+    ),
+    "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE": lambda: os.getenv(
+        "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE"
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton
