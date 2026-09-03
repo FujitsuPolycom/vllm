@@ -18,11 +18,11 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 )
 from vllm.models.deepseek_v4.nvidia import b12x as b12x_mla
 from vllm.models.deepseek_v4.nvidia import b12x_indexer
-from vllm.models.deepseek_v32.attention import (
-    DeepseekV32Indexer,
-    _select_sparse_components,
+from vllm.models.deepseek_v32.nvidia.b12x import (
+    B12xDSAIndexer,
+    DeepseekV32B12xAttention,
 )
-from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
+from vllm.models.deepseek_v32.nvidia.model import _get_attention_cls
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
@@ -65,11 +65,8 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
     config = SimpleNamespace(
         attention_config=SimpleNamespace(backend=AttentionBackendEnum.B12X)
     )
-    indexer_cls, backend_cls = _select_sparse_components(
-        config, None, DeepseekV32Indexer
-    )
-    assert indexer_cls is B12xDeepseekV32Indexer
-    assert backend_cls is B12xMLASparseBackend
+    assert _get_attention_cls(config) is DeepseekV32B12xAttention
+    assert DeepseekV32B12xAttention.indexer_cls is B12xDSAIndexer
 
 
 def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
@@ -615,6 +612,7 @@ def test_b12x_sparse_mla_reserves_largest_planned_workspace(monkeypatch) -> None
     impl._max_tokens = 64
     impl._input_num_heads = 8
     impl._q_head_dim = 512
+    impl._scratch_nbytes = 512
     impl._decode_plan = SimpleNamespace(
         shapes_and_dtypes=lambda: (((32,), torch.uint8),)
     )
@@ -886,27 +884,29 @@ def test_b12x_dsv4_backend_preserves_cache_contract() -> None:
 def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None:
     calls: dict[str, Any] = {}
 
-    def bind(**kwargs):
+    def bind(bound_plan, **kwargs):
+        calls["bind_plan"] = bound_plan
         calls["bind"] = kwargs
-        return SimpleNamespace(route="packed_contiguous")
+        return SimpleNamespace(
+            output=kwargs["output_indices"],
+            scores=kwargs["output_scores"],
+        )
 
     plan = SimpleNamespace(
-        route="packed_contiguous",
         shapes_and_dtypes=lambda: (((64,), torch.uint8),),
-        bind=bind,
     )
 
-    def index_topk_fp8(**kwargs):
-        calls["run"] = kwargs
-        kwargs["out_indices"].fill_(7)
-        kwargs["out_scores"].fill_(0.5)
+    def run(binding):
+        calls["run"] = binding
+        binding.output.fill_(7)
+        binding.scores.fill_(0.5)
 
     module = SimpleNamespace(
         Caps=lambda **kwargs: SimpleNamespace(**kwargs),
-        SOURCE_LAYOUT_PAGED="paged",
         PAGED_INDEX_PAGE_SIZE=64,
         plan=lambda caps: plan,
-        index_topk_fp8=index_topk_fp8,
+        bind=bind,
+        run=run,
     )
     monkeypatch.setattr(generic_b12x_indexer, "_require_b12x_indexer", lambda: module)
     monkeypatch.setattr(
@@ -918,21 +918,21 @@ def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None
     output = torch.empty((2, 4), dtype=torch.int32)
     scores = torch.empty((2, 4), dtype=torch.float32)
     generic_b12x_indexer._run_paged_topk(
+        module=module,
+        plan=plan,
         q=torch.empty((2, 32, 128), dtype=torch.float8_e4m3fn),
         weights=torch.empty((2, 32), dtype=torch.float32),
         kv_cache=torch.empty((4, 64, 132), dtype=torch.uint8),
         seq_lens=torch.full((2,), 128, dtype=torch.int32),
         block_table=torch.zeros((2, 2), dtype=torch.int32),
-        schedule_metadata=None,
-        active_width=None,
+        active_width=torch.full((1,), 128, dtype=torch.int32),
         output=output,
         scores=scores,
-        topk=4,
-        shared_page_table=True,
     )
 
-    assert calls["bind"]["output_physical_slots"] is False
-    assert calls["run"]["out_scores"] is scores
+    assert calls["bind_plan"] is plan
+    assert calls["bind"]["output_scores"] is scores
+    assert calls["run"].scores is scores
     assert torch.count_nonzero(output != 7) == 0
     assert torch.count_nonzero(scores != 0.5) == 0
 

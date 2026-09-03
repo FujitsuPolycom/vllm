@@ -1,26 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""B12x sparse-MLA components for DeepSeek V3.2-compatible models."""
+"""B12x sparse-MLA components for DSA models on NVIDIA GPUs."""
 
 import torch
 
 from vllm.config import VllmConfig
-from vllm.models.deepseek_v32.attention import DeepseekV32Indexer
+from vllm.models.deepseek_v32.attention import (
+    DeepseekV32Attention,
+    DeepseekV32Indexer,
+)
 from vllm.v1.attention.backends.mla.b12x_indexer import (
     B12xIndexerCache,
     B12xSparseIndexer,
 )
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseBackend
 
 
-class B12xDeepseekV32Indexer(DeepseekV32Indexer):
+class B12xDSAIndexer(DeepseekV32Indexer):
     indexer_cache_cls = B12xIndexerCache
     indexer_op_cls = B12xSparseIndexer
 
     @staticmethod
-    def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, bool]:
+    def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, int | bool]:
         if vllm_config.parallel_config.prefill_context_parallel_size > 1:
             raise NotImplementedError("B12X sparse MLA does not support PCP.")
-        return {"skip_k_cache_insert": True}
+        return {
+            "skip_k_cache_insert": True,
+            "num_q_heads": int(vllm_config.model_config.hf_text_config.index_n_heads),
+            "output_physical_slots": (
+                vllm_config.parallel_config.decode_context_parallel_size == 1
+            ),
+        }
 
     def run_indexer(
         self,
@@ -45,4 +55,17 @@ class B12xDeepseekV32Indexer(DeepseekV32Indexer):
         return self.indexer_op(hidden_states, q_quant, k, weights)
 
 
-__all__ = ["B12xDeepseekV32Indexer"]
+class DeepseekV32B12xAttention(DeepseekV32Attention):
+    indexer_cls = B12xDSAIndexer
+
+    def __init__(self, vllm_config, config, prefix, topk_indices_buffer=None):
+        super().__init__(
+            vllm_config,
+            config,
+            prefix,
+            topk_indices_buffer,
+            attn_backend=B12xMLASparseBackend,
+        )
+
+
+__all__ = ["B12xDSAIndexer", "DeepseekV32B12xAttention"]
