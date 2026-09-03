@@ -173,11 +173,13 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert unidentified == probe
     assert packed_by_glm_backend.state_content_bytes == 528
     assert packed_by_glm_backend.page_size_padded is None
-    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 33)
+    assert packed_by_glm_backend.page_tail_bytes_per_token == 132 // 4
+    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 132 // 4)
     assert packed_by_glm_backend.model_version == "glm5_next"
     assert packed.state_content_bytes == 528
     assert packed.page_size_padded is None
-    assert packed.page_size_bytes == 64 * (528 + 33)
+    assert packed.page_tail_bytes_per_token == 132 // 4
+    assert packed.page_size_bytes == 64 * (528 + 132 // 4)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)
@@ -374,23 +376,24 @@ def test_b12x_glm5_next_rejects_recipe_drift(monkeypatch) -> None:
     ]
 
 
-def test_b12x_glm5_next_selected_indices_use_physical_slots() -> None:
+def test_b12x_glm5_next_ckv_source_layout() -> None:
     storage = torch.empty((2 * 37888,), dtype=torch.uint8)
     cache = torch.as_strided(
         storage,
         size=(2, 64, 528),
         stride=(37888, 528, 1),
     )
-    assert (
-        _selected_index_block_stride_rows(
-            cache,
-            block_size=64,
-            is_glm_next=True,
-        )
-        == 64
-    )
     assert _is_glm_next_ckv_source_layout(cache, page_size=64)
     assert not _is_glm_next_ckv_source_layout(cache[:, :, ::2], page_size=64)
+
+
+@pytest.mark.parametrize("record_bytes", [528, 656])
+def test_b12x_selected_indices_use_physical_slots(record_bytes: int) -> None:
+    storage = torch.empty((2, 2, 64, record_bytes), dtype=torch.uint8)
+    cache = storage[:, 0]
+
+    assert cache.stride(0) // record_bytes == 128
+    assert _selected_index_block_stride_rows(cache, block_size=64) == 64
 
 
 def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
@@ -437,10 +440,10 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
     class FakeCaps(SimpleNamespace):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
+            self.layout = SimpleNamespace(nbytes=256)
 
-        @staticmethod
-        def shapes_and_dtypes():
-            return ()
+        def shapes_and_dtypes(self):
+            return (((self.layout.nbytes,), torch.uint8),)
 
     class FakeModule:
         Caps = FakeCaps
@@ -466,6 +469,8 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
     impl._kv_dtype = torch.uint8
     impl._q_head_dim = 512
     impl.kv_lora_rank = 512
+    impl.scale = 256**-0.5
+    impl.need_to_return_lse_for_decode = True
     impl._model_type = 1
     impl._ckv_gather_enabled = True
     impl._ckv_capacity_tokens = 131200
@@ -499,10 +504,17 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
         (16, 4096, 4096),
     ]
     assert len(reservations) == 3
-    assert reservations[0] == (((4096, 64, 512), torch.bfloat16),)
-    assert reservations[1] == (((4096, 64, 512), torch.bfloat16),)
+    assert reservations[0] == (
+        ((4096, 64, 512), torch.bfloat16),
+        ((256,), torch.uint8),
+    )
+    assert reservations[1] == (
+        ((4096, 64, 512), torch.bfloat16),
+        ((256,), torch.uint8),
+    )
     assert reservations[2] == (
         ((4096, 16, 512), torch.bfloat16),
+        ((256,), torch.uint8),
         ((131328, 528), torch.uint8),
         ((525312, 528), torch.uint8),
     )
@@ -1166,31 +1178,36 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         calls["caps"] = kwargs
         return SimpleNamespace(**kwargs)
 
-    def bind(**kwargs):
+    def bind(bound_plan, **kwargs):
+        calls["bind_plan"] = bound_plan
         calls["bind"] = kwargs
-        return SimpleNamespace(route="packed_contiguous")
+        return SimpleNamespace(
+            plan=bound_plan,
+            route="packed_contiguous",
+            output=kwargs["output_indices"],
+        )
 
     plan = SimpleNamespace(
-        route="packed_contiguous",
+        layout=SimpleNamespace(route="packed_contiguous"),
         shapes_and_dtypes=lambda: (((64,), torch.uint8),),
-        bind=bind,
     )
 
-    def index_topk_fp8(**kwargs):
-        calls["run"] = kwargs
-        kwargs["out_indices"].fill_(11)
+    def run(binding):
+        calls["run"] = binding
+        calls["output_before_run"] = binding.output.clone()
+        binding.output.fill_(11)
 
     module = SimpleNamespace(
         Caps=make_caps,
-        SOURCE_LAYOUT_PAGED="paged",
         PAGED_INDEX_PAGE_SIZE=64,
         plan=lambda caps: plan,
-        index_topk_fp8=index_topk_fp8,
+        bind=bind,
+        run=run,
     )
     monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
     monkeypatch.setattr(b12x_indexer, "current_workspace_manager", lambda: _Workspace())
 
-    output = torch.empty((3, 4), dtype=torch.int32)
+    output = torch.full((3, 4), 37, dtype=torch.int32)
     scores = torch.empty((3, 4), dtype=torch.float32)
     b12x_indexer._run_paged_topk(
         module=module,
@@ -1200,18 +1217,16 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         kv_cache=torch.empty((4, 64, 132), dtype=torch.uint8),
         seq_lens=torch.full((3,), 128, dtype=torch.int32),
         block_table=torch.zeros((3, 2), dtype=torch.int32),
-        schedule_metadata=None,
-        active_width=None,
+        active_width=torch.full((1,), 128, dtype=torch.int32),
         output=output,
         scores=scores,
-        topk=4,
         shared_page_table=True,
     )
 
-    assert calls["run"]["out_scores"] is scores
+    assert calls["bind"]["output_scores"] is scores
+    assert torch.count_nonzero(calls["output_before_run"] != 37) == 0
 
     builder = object.__new__(b12x_indexer.DeepseekV4B12xIndexerMetadataBuilder)
-    builder.prefill_k_rows = 32768
     builder.max_prefill_buffer_size = 1 << 30
     assert builder._supports_native_decode(8)
     assert builder._split_prefill_chunks(
@@ -1223,8 +1238,10 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         (slice(1, 2), slice(0, 1)),
         (slice(2, 3), slice(0, 1)),
     ]
-    assert calls["bind"]["output_physical_slots"] is False
-    assert calls["run"]["out_indices"] is output
+    assert calls["bind_plan"] is plan
+    assert calls["bind"]["active_width"].item() == 128
+    assert calls["bind"]["output_indices"] is output
+    assert calls["run"].output is output
     assert torch.count_nonzero(output != 11) == 0
 
     indexer = b12x_indexer.DeepseekV4B12xSparseIndexer(
@@ -1242,94 +1259,9 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     indexer._reserve_profile_workspace(
         torch.empty((2, 64, 128), dtype=torch.float8_e4m3fn)
     )
-    assert calls["caps"]["source_layout"] == "paged"
+    assert "source_layout" not in calls["caps"]
+    assert "shared_page_table" not in calls["caps"]
     assert calls["caps"]["max_page_table_width"] == 1024
-
-
-@pytest.mark.parametrize(
-    ("route", "expected_initial_value"),
-    [("paged_fused", 17), ("paged_tiled", -1)],
-)
-def test_b12x_paged_topk_initializes_only_non_fused_routes(
-    monkeypatch, route: str, expected_initial_value: int
-) -> None:
-    observed: list[torch.Tensor] = []
-
-    plan = SimpleNamespace(
-        layout=SimpleNamespace(route=route),
-        shapes_and_dtypes=lambda: (),
-        bind=lambda **kwargs: SimpleNamespace(route=route),
-    )
-
-    def index_topk_fp8(**kwargs):
-        output = kwargs["out_indices"]
-        observed.append(output.clone())
-        output.fill_(5)
-
-    module = SimpleNamespace(
-        PAGED_INDEX_PAGE_SIZE=64,
-        index_topk_fp8=index_topk_fp8,
-    )
-    monkeypatch.setattr(b12x_indexer, "current_workspace_manager", lambda: _Workspace())
-    output = torch.full((2, 4), 17, dtype=torch.int32)
-
-    b12x_indexer._run_paged_topk(
-        module=module,
-        plan=plan,
-        q=torch.empty((2, 16, 128), dtype=torch.float8_e4m3fn),
-        weights=torch.empty((2, 16, 1), dtype=torch.float32),
-        kv_cache=torch.empty((4, 64, 132), dtype=torch.uint8),
-        seq_lens=torch.full((2,), 128, dtype=torch.int32),
-        block_table=torch.zeros((2, 2), dtype=torch.int32),
-        schedule_metadata=None,
-        active_width=None,
-        output=output,
-        scores=None,
-        topk=4,
-        shared_page_table=False,
-    )
-
-    assert torch.count_nonzero(observed[0] != expected_initial_value) == 0
-    assert torch.count_nonzero(output != 5) == 0
-
-
-def test_b12x_decode_metadata_uses_plan_capacity_for_active_width(monkeypatch) -> None:
-    decode = b12x_indexer.DeepSeekV32IndexerDecodeMetadata(
-        block_table=torch.zeros((2, 4), dtype=torch.int32),
-        seq_lens=torch.full((2,), 128, dtype=torch.int32),
-        decode_lens=torch.ones((2,), dtype=torch.int32),
-        requires_padding=False,
-        schedule_metadata=torch.empty(0, dtype=torch.int32),
-    )
-    metadata = b12x_indexer.DeepseekV32IndexerMetadata(
-        seq_lens=decode.seq_lens,
-        max_seq_len=128,
-        slot_mapping=torch.arange(2, dtype=torch.int64),
-        num_decodes=2,
-        num_decode_tokens=2,
-        num_prefills=0,
-        num_prefill_tokens=0,
-        decode=decode,
-    )
-    monkeypatch.setattr(
-        b12x_indexer.DeepseekV32IndexerMetadataBuilder,
-        "build",
-        lambda self, *args, **kwargs: metadata,
-    )
-    monkeypatch.setattr(
-        b12x_indexer,
-        "_require_b12x_indexer",
-        lambda: SimpleNamespace(uses_paged_schedule=lambda **kwargs: False),
-    )
-    builder = object.__new__(b12x_indexer.DeepseekV4B12xIndexerMetadataBuilder)
-    builder.scheduler_metadata_buffer = torch.empty(0, dtype=torch.int32)
-    builder.num_sms = 1
-
-    result = builder.build()
-
-    assert isinstance(result.decode, b12x_indexer.DeepseekV4B12xIndexerDecodeMetadata)
-    assert result.decode.active_width is None
-    assert not hasattr(builder, "active_width_buffer")
 
 
 def test_b12x_dsa_indexer_reuses_plans_and_rebinds_shared_workspace(
@@ -1337,30 +1269,33 @@ def test_b12x_dsa_indexer_reuses_plans_and_rebinds_shared_workspace(
 ) -> None:
     calls = {"plan": 0, "workspace": 0, "bind": 0, "run": 0}
 
-    def bind(**kwargs):
+    def bind(bound_plan, **kwargs):
         calls["bind"] += 1
-        return SimpleNamespace(route="packed_contiguous")
+        return SimpleNamespace(
+            plan=bound_plan,
+            route="packed_contiguous",
+            output=kwargs["output_indices"],
+        )
 
     plan = SimpleNamespace(
-        route="packed_contiguous",
+        layout=SimpleNamespace(route="packed_contiguous"),
         shapes_and_dtypes=lambda: (((64,), torch.uint8),),
-        bind=bind,
     )
 
     def make_plan(_caps):
         calls["plan"] += 1
         return plan
 
-    def index_topk_fp8(**kwargs):
+    def run(binding):
         calls["run"] += 1
-        kwargs["out_indices"].fill_(7)
+        binding.output.fill_(7)
 
     module = SimpleNamespace(
         Caps=lambda **kwargs: SimpleNamespace(**kwargs),
-        SOURCE_LAYOUT_PAGED="paged",
         PAGED_INDEX_PAGE_SIZE=64,
         plan=make_plan,
-        index_topk_fp8=index_topk_fp8,
+        bind=bind,
+        run=run,
     )
 
     class Workspace:
