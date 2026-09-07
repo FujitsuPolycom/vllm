@@ -26,6 +26,40 @@ path. MTP layers cannot receive mHC ownership. All TP ranks agree on activation
 at construction and on eligible metadata/capabilities before issuing partial
 outputs. Unsupported enabled configurations fail explicitly.
 
+## Native cache geometry for qualification
+
+The 512-token cache layout used by the standalone schedule below requires these
+worker environment settings on every rank:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=512
+export VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=512
+export VLLM_GLM53_MHC_PREFILL_SHARD=1
+```
+
+Retain the model and parallel configuration described above. Set
+`--block-size 512 --mamba-block-size 512 --mamba-cache-mode align`
+and `--recurrent-checkpoint-policy aligned --prefix-cache-retention-interval 0`.
+The split-page settings are native platform controls already present in the
+baseline implementation. They preserve independent attention and recurrent
+pages; requesting 512 only through the CLI does not prevent page harmonization
+from choosing a larger token block. The value `auto` selects a different layout
+and is not interchangeable with the fixed values in this protocol.
+
+Verify physical target/recurrent blocks of 512 tokens, prefix-lookup alignment
+of 512, and DCP4 scheduler alignment of 2,048 in the resolved configuration.
+Hold both split-page settings constant across comparison arms. These settings
+require neither a SparkCache connector nor continuation coalescing or its B12X
+checkpoint extension.
+
+Cache geometry does not itself activate mHC. A scheduled forward must still
+meet the 8,192-row pure-prefill admission gate. Enable the diagnostics described
+below for an activation check and require request-kind `GLM_MHC_ENQUEUE` records
+on all four ranks, followed by successful request completion. Startup/dummy
+records and enabled environment flags alone do not establish that the request
+used token ownership. Hold the diagnostic setting constant within comparisons.
+
 ## Computation and tensor lifetime
 
 The first mHC pre runs on full tokens. Its residual, post, and combine state
