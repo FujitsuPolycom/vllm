@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contracts for GLM mHC admission, reduction, and token ownership."""
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import MethodType
@@ -315,9 +316,13 @@ class CPUFabric:
 class CPUOwner:
     def __init__(self, fabric, rank):
         self.fabric, self.rank = fabric, rank
+        self.mhc_calls = []
 
     def local_view(self, value):
         return value.chunk(4)[self.rank]
+
+    def record_mhc(self, stage, output):
+        self.mhc_calls.append((stage, output.shape[0]))
 
     def reduce_scatter(self, value):
         return self.fabric.exchange(self.rank, "rs", value)
@@ -329,6 +334,10 @@ class CPUOwner:
         calls = self.fabric.calls[self.rank]
         assert calls.count("rs") == 2 * layers
         assert calls.count("ag") == 2 * layers + auxiliary_gathers
+        assert self.mhc_calls.count(("first_pre", 8)) == 1
+        assert self.mhc_calls.count(("attention_post_pre", 2)) == layers - 1
+        assert self.mhc_calls.count(("ffn_post_pre", 2)) == layers
+        assert self.mhc_calls.count(("final_post", 2)) == 1
 
 
 def test_model_preserves_full_final_auxiliary_and_owner_residual_boundaries(
@@ -609,3 +618,131 @@ def test_unmodified_scheduler_produces_independent_mhc_chunks(
         request.num_computed_tokens += size
     assert chunks == expected_chunks
     assert owned == [size == 8192 for size in expected_chunks]
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ("disabled", "disabled"),
+        ("hidden_shape", "hidden_shape"),
+        ("capture", "stream_capture"),
+        ("no_context", "missing_forward_context"),
+        ("graph", "execution_context"),
+        ("ubatch", "execution_context"),
+        ("positions", "local_ineligible"),
+        ("metadata", "local_ineligible"),
+        ("eligible", "admitted"),
+    ],
+)
+def test_diagnostics_report_actual_admission_branches(
+    monkeypatch, admission, change, reason
+):
+    monkeypatch.setattr(envs, "VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS", True)
+    ownership.configure(admission.model, admission.config, True)
+    context = NS(
+        cudagraph_runtime_mode=NS(name="NONE"),
+        ubatch_slices=None,
+        attn_metadata={"gdn": metadata()},
+        is_dummy_run=False,
+    )
+    monkeypatch.setattr(
+        forward_context, "is_forward_context_available", lambda: change != "no_context"
+    )
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    monkeypatch.setattr(ownership, "validate_model", lambda model: ("gdn",))
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: change == "capture"
+    )
+    hidden = NS(
+        shape=(8192, 4096),
+        is_cuda=True,
+        dtype=torch.bfloat16,
+        device=admission.group.device_communicator.pynccl_comm.device,
+    )
+    positions = NS(shape=(8192,))
+    if change == "disabled":
+        admission.model._mhc_prefill_enabled = False
+    elif change == "hidden_shape":
+        hidden.shape = (16, 4096)
+    elif change == "graph":
+        context.cudagraph_runtime_mode.name = "PIECEWISE"
+    elif change == "ubatch":
+        context.ubatch_slices = object()
+    elif change == "positions":
+        positions.shape = (16,)
+    elif change == "metadata":
+        context.attn_metadata = {"gdn": metadata(num_spec_decodes=1)}
+    result = ownership.maybe_create(admission.model, hidden, positions)
+    assert (result is not None) == (change == "eligible")
+    diagnostic = admission.model._mhc_prefill_diagnostics
+    kind = "no_context" if change == "no_context" else "request"
+    assert diagnostic.decisions[f"{kind}:{reason}"] == 1
+
+
+def test_suppressed_logging_retains_request_diagnostic_and_enqueue_witness(
+    monkeypatch, caplog
+):
+    monkeypatch.setattr(ownership._LOG, "handlers", [caplog.handler])
+    context = NS(is_dummy_run=True)
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    diagnostic = ownership.PrefillDiagnostics(2)
+    with monkeypatch.context() as suppressed:
+        suppressed.setattr(ownership._LOG, "isEnabledFor", lambda level: False)
+        for _ in range(12):
+            diagnostic.decision("admitted")
+        assert diagnostic.emitted == set()
+    with caplog.at_level(logging.WARNING, logger=ownership._LOG.name):
+        diagnostic.decision("admitted")
+        context.is_dummy_run = False
+        diagnostic.decision("admitted")
+        owner = ownership.PrefillOwnership(
+            None,
+            2,
+            rs_count=90,
+            ag_count=90,
+            diagnostics=diagnostic,
+            diagnostic_kind="request",
+            diagnostic_forward=14,
+        )
+        owner.record_mhc("first_pre", NS(shape=(8192, 4096)))
+        for _ in range(44):
+            owner.record_mhc("attention_post_pre", NS(shape=(2048, 4096)))
+        for _ in range(45):
+            owner.record_mhc("ffn_post_pre", NS(shape=(2048, 4096)))
+        owner.record_mhc("final_post", NS(shape=(2048, 4, 4096)))
+        owner.finish(45, 0)
+    assert diagnostic.decisions == {"dummy:admitted": 13, "request:admitted": 1}
+    assert '"kind": "request"' in caplog.text
+    assert '"kind": "dummy"' in caplog.text
+    assert "GLM_MHC_ENQUEUE" in caplog.text
+    assert '"attention_post_pre": {"2048": 44}' in caplog.text
+    assert '"gpu_completion_verified": false' in caplog.text
+
+
+def test_metadata_diagnostic_never_reads_non_host_counts():
+    class DeviceCount:
+        def __repr__(self):
+            pytest.fail("Diagnostics must not represent device-backed values")
+
+        def __int__(self):
+            pytest.fail("Diagnostics must not read device-backed values")
+
+    result = ownership.metadata_diagnostics(
+        {"gdn": metadata(num_prefills=DeviceCount())}, ("gdn", "absent")
+    )
+    assert result["metadata_counts"]["gdn"]["num_prefills"] == {
+        "type": "DeviceCount",
+        "value": None,
+    }
+    assert result["missing_names"] == ["absent"]
+
+
+def test_forward_context_retains_host_dummy_marker():
+    config = NS(
+        compilation_config=NS(fast_moe_cold_start=False, static_forward_context={})
+    )
+    assert not forward_context.create_forward_context(None, config).is_dummy_run
+    assert forward_context.create_forward_context(
+        None, config, is_dummy_run=True
+    ).is_dummy_run

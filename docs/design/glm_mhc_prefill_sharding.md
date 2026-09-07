@@ -72,6 +72,31 @@ not accelerate the 8K prompt in this uncoalesced schedule: none of that prompt's
 forwards reaches the row gate. Other retention or scheduling settings may change
 coverage. These are CPU scheduling/admission results, not GPU timing results.
 
+## Admission and execution diagnostics
+
+`VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS=1` enables host-only diagnostic warnings;
+the default is zero. It does not enable mHC ownership or change eligibility.
+`GLM_MHC_DIAGNOSTIC` records the configuration flag, fallback reason, observed
+hidden shapes, graph mode, and GDN admission counts with their Python types.
+Non-host count values are omitted without converting or printing tensors.
+Each reason is reported once per request/dummy category; shape rejection also
+distinguishes each observed shape. Suppressed logging does not consume reports.
+Compiler tracing skips diagnostic mutation.
+
+`GLM_MHC_ENQUEUE` records each admitted forward after all its host calls return:
+rank, request/dummy category, collective enqueue counts, and actual mHC output
+row counts grouped by operation. For 45 base layers with no auxiliary captures,
+the expected witness is 90 reduce-scatters, 90 gathers, one 8,192-row first pre,
+44 attention post/pre calls on 2,048 rows, 45 FFN post/pre calls on 2,048 rows,
+and one final post on 2,048 rows. The V2 runner marks dummy forwards through a
+host-only forward-context field, so startup work cannot consume request reports.
+
+These records prove host dispatch and tensor geometry, not asynchronous GPU
+completion or numerical correctness. Successful request completion and the
+correctness protocol remain required. Diagnostic logging adds host work; record
+its setting with benchmark conditions and disable it for isolated throughput
+qualification after activation has been established.
+
 ## CPU validation
 
 In a supported vLLM development environment:

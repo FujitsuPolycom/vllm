@@ -606,6 +606,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 )
             if mhc_prefill_ownership is not None:
                 # First pre stays full-sized, avoiding an extra boundary AG.
+                mhc_prefill_ownership.record_mhc("first_pre", x)
                 residual = mhc_prefill_ownership.local_view(residual)
                 post = mhc_prefill_ownership.local_view(post)
                 comb = mhc_prefill_ownership.local_view(comb)
@@ -626,6 +627,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if mhc_prefill_ownership is not None:
             if not first_full_pre:
+                mhc_prefill_ownership.record_mhc("attention_post_pre", x)
                 x = mhc_prefill_ownership.all_gather(x)
         elif self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
@@ -664,6 +666,7 @@ class Glm5NextDecoderLayer(nn.Module):
 
         # Fully Connected
         if mhc_prefill_ownership is not None:
+            mhc_prefill_ownership.record_mhc("ffn_post_pre", x)
             x = mhc_prefill_ownership.all_gather(x)
             x = self.mlp(x, defer_tp_reduction=True)
             x = mhc_prefill_ownership.reduce_scatter(x)
@@ -681,6 +684,8 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.layer_idx == self.num_hidden_layers - 1:
             x = self.hc_post(x, residual, post, comb)
+            if mhc_prefill_ownership is not None:
+                mhc_prefill_ownership.record_mhc("final_post", x)
             x = hc_contract(x, self.n)
             return x, None, None, None
 

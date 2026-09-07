@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_GLM53_MHC_PREFILL_SHARD: bool = False
+    VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS: bool = False
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
@@ -1646,6 +1647,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Restrict GLM mHC token ownership to eligible GB10 TP4/DCP4 eager prefills.
     "VLLM_GLM53_MHC_PREFILL_SHARD": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_PREFILL_SHARD", "0"))
+    ),
+    "VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS": lambda: bool(
+        int(os.getenv("VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS", "0"))
     ),
     # Dense activation precision; recipe overrides take precedence.
     "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
