@@ -97,21 +97,24 @@ The feature calls the existing B12X mHC API. It requires no two-checkpoint B12X
 extension and does not enable continuation coalescing. Scheduler chunk sizes
 still determine whether an individual forward reaches the 8,192-row gate.
 
-CPU execution of the unmodified scheduler and real KV cache manager demonstrates
-independent eligibility with one B12X checkpoint, MTP3, physical/hash blocks of
-512 tokens, scheduler blocks of 2,048, and sparse retention interval zero:
+With coalescing disabled, the TP4/DCP4 layout above retains four interior states
+in the final 8K of a cold prompt: 4,096, 2,048, 1,024 and 512 tokens before the
+prompt end. Ordinary splitting stops at each retained position and then finishes
+the remaining 512 tokens. Its scheduled sequence is:
 
 | Prompt | Scheduled chunks with coalescing off | mHC-owned forwards |
 | --- | --- | ---: |
-| 8K | 4,096 + 2,048 + 2,048 | 0 |
-| 16K | 8,192 + 4,096 + 2,048 + 2,048 | 1 |
-| 32K | Three 8,192 chunks + 4,096 + 2,048 + 2,048 | 3 |
-| 64K | Seven 8,192 chunks + 4,096 + 2,048 + 2,048 | 7 |
+| 8K | 4,096 + 2,048 + 1,024 + 512 + 512 | 0 |
+| 16K | 8,192 + 4,096 + 2,048 + 1,024 + 512 + 512 | 1 |
+| 32K | Three 8,192 chunks + 4,096 + 2,048 + 1,024 + 512 + 512 | 3 |
 
 Thus mHC can activate independently for full chunks of long prompts. It does
 not accelerate the 8K prompt in this uncoalesced schedule: none of that prompt's
 forwards reaches the row gate. Other retention or scheduling settings may change
-coverage. These are CPU scheduling/admission results, not GPU timing results.
+coverage. The [serving evidence](../benchmarking/glm-mhc-sharding-20260907/evidence.json)
+records zero, one and three eligible 8,192-row forwards per measured 8K, 16K and
+32K prompt on every rank. The split sequence follows the DCP4 retention rules;
+the activation counts are corroborated by request-associated dispatch records.
 
 ## Admission and execution diagnostics
 
@@ -129,8 +132,12 @@ rank, request/dummy category, collective enqueue counts, and actual mHC output
 row counts grouped by operation. For 45 base layers with no auxiliary captures,
 the expected witness is 90 reduce-scatters, 90 gathers, one 8,192-row first pre,
 44 attention post/pre calls on 2,048 rows, 45 FFN post/pre calls on 2,048 rows,
-and one final post on 2,048 rows. The V2 runner marks dummy forwards through a
-host-only forward-context field, so startup work cannot consume request reports.
+and one final post on 2,048 rows. The V2 model-runner entry point marks dummy
+forwards through a host-only forward-context field. Direct CUDA graph-manager
+contexts do not set that field and can emit request-labeled shape rejections
+during startup. Their capture sizes are below the 8,192-row gate. Require the
+complete enqueue geometry within a completed API-request interval on every
+rank; a request label or shape-rejection record alone does not prove activation.
 
 These records prove host dispatch and tensor geometry, not asynchronous GPU
 completion or numerical correctness. Successful request completion and the
@@ -155,34 +162,33 @@ state. They also check hardware/configuration rejection, mixed/graph fallback,
 rank disagreement, exactly-once reduction, prefetch callbacks, and output stream
 ownership. They do not validate CUDA visibility, NCCL transport, or model quality.
 
-## GPU and full-model qualification protocol
+## Serving evidence and remaining qualification
 
-The following work is pending and must use an explicitly authorized test stack.
-Keep model revision, weights, B12X revision, TP/DCP settings, cache settings,
-sampling parameters, and worker image identical between arms; change only
-`VLLM_GLM53_MHC_PREFILL_SHARD`.
+The [four-arm report](../benchmarking/glm-mhc-sharding-20260907/report.md) records
+completed model loading/warmup, request-associated mHC activation, 20
+exact-answer/cache-reuse checks, 36 cold 8K/16K/32K prefill samples, and 16
+decode cells. It includes mHC enabled and disabled, each with coalescing enabled
+and disabled. Decode used C1/C4 at 8K/32K contexts for 20 seconds per cell.
+All selected requests completed without reported errors. These are bounded
+serving observations from the identified source/image composition.
 
-1. Complete model loading and automatic warmup with the feature off and on.
-   Record all-rank health and the exact source/image/toolchain identities.
-2. For cold 8K, 16K, 32K, and 64K prompts, record actual scheduled token counts
-   and `GLM_MHC_PREFILL` activation/count logs. Reject missing workers, partial
-   collectives, or unexpected auxiliary-output shapes.
-3. Compare complete logits or token log-probabilities, exact-answer probes, and
-   recurrent/cache state across fresh, continued, repeated, and extended prompts.
-   A different collective reduction order is not expected to be bitwise equal;
-   numerical and model-quality acceptance criteria must be declared before
-   evaluating results.
-4. Exercise prefill followed by captured MTP decode, eager small batches, and
-   concurrent decode plus prefill. Verify mixed batches use ordinary reductions.
-   Check decode and cache correctness separately from prefill throughput.
-5. Run the repository's [GSM8K](../../tests/evals/gsm8k/README.md) and
-   [MRCR](../../tests/evals/mrcr/README.md) evaluation protocols against each
-   server arm. Save raw evaluation outputs and compare accuracy, including
-   long-context buckets. No evaluation result is supplied by this source port.
-6. Measure cold-prefill TTFT using exact token counts and explicit zero cached
-   tokens after warmup. Interleave repeated arms, preserve errors, and report
-   variability and any changed clock/power/cache/launch conditions.
+The following qualification remains unrun and requires an authorized test stack:
 
-Standalone mHC and continuation coalescing must be tested independently before
-the combined setting. No GPU result from a different runtime composition
-qualifies this source change.
+1. Compare complete logits or token log-probabilities and recurrent/cache states
+   across fresh, continued, repeated and extended prompts. Declare numerical
+   and model-quality acceptance criteria before evaluation; changed collective
+   reduction order is not expected to be bitwise equal.
+2. Cover 64K/128K prompts, controlled concurrent decode plus prefill, preemption,
+   and extended reliability. Verify mixed batches retain ordinary reductions.
+3. Run the repository's [GSM8K](../../tests/evals/gsm8k/README.md) and
+   [MRCR](../../tests/evals/mrcr/README.md) evaluations against each server arm,
+   retaining raw accuracy results and long-context buckets.
+4. Repeat interleaved cold-prefill comparisons with exact token counts and zero
+   cached tokens after warmup. Preserve errors and report clock, power, cache
+   and launch conditions. The recorded sequential runs and short decode windows
+   do not establish a confidence interval or exclude small regressions.
+
+Hold model weights, source/image revisions, TP/DCP, cache geometry and sampling
+fixed in each comparison. To isolate the incremental mHC effect, hold coalescing
+fixed and vary only `VLLM_GLM53_MHC_PREFILL_SHARD`. Source changes or a different
+runtime composition require their own qualification evidence.
