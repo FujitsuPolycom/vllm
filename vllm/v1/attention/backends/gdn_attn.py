@@ -23,7 +23,10 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.core.recurrent_prefill_checkpoint import checkpoint_metadata
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    COALESCED_CHECKPOINT_CAPACITY,
+    checkpoint_metadata,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 
@@ -591,7 +594,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             seq_lens = m.seq_lens_cpu_upper_bound.tolist()
             block_size = self.kv_cache_spec.block_size
-            capacity = min(self.kv_cache_spec.num_prefill_checkpoint_blocks, 2)
+            capacity = min(
+                self.kv_cache_spec.num_prefill_checkpoint_blocks,
+                COALESCED_CHECKPOINT_CAPACITY,
+            )
             plans = getattr(m, "recurrent_prefill_checkpoint_plans_cpu", None)
             if plans is not None and len(plans) < len(all_query_lens):
                 raise ValueError("checkpoint plan rows do not cover the packed batch")
@@ -638,7 +644,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     checkpoint_columns_tensor = checkpoint_columns_tensor[:, 0]
                 checkpoint_state_indices = m.block_table_tensor[
                     request_rows_tensor[:, None]
-                    if capacity == 2
+                    if capacity > 1
                     else request_rows_tensor,
                     checkpoint_columns_tensor,
                 ]

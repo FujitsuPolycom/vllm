@@ -99,8 +99,10 @@ def test_one_checkpoint_binding_retains_vector_metadata_without_mhc_state():
     assert observed["initial_state_indices"].tolist() == [1]
 
 
+@pytest.mark.parametrize("capacity", [2, 4])
 def test_checkpoint_convolution_stores_causal_history_not_speculative_capacity(
     monkeypatch,
+    capacity,
 ):
     from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn as module
 
@@ -118,30 +120,35 @@ def test_checkpoint_convolution_stores_causal_history_not_speculative_capacity(
     monkeypatch.setattr(module, "_store_cache_checkpoints_kernel", CaptureKernel())
     layer = NS(conv1d=NS(weight=torch.empty(6, 1, 4)))
     checkpoint = NS(
-        checkpoint_offsets=torch.tensor([[16, 32]], dtype=torch.int32),
-        state_indices=torch.tensor([[2, 3]], dtype=torch.int32),
+        checkpoint_offsets=torch.arange(1, capacity + 1, dtype=torch.int32).reshape(
+            1, capacity
+        )
+        * 16,
+        state_indices=torch.arange(2, capacity + 2, dtype=torch.int32).reshape(
+            1, capacity
+        ),
     )
     error = torch.zeros(1, dtype=torch.int32)
     module.KimiGatedDeltaNetAttention._store_kda_conv_checkpoint(
         layer,
-        mixed_qkv=torch.empty(32, 6),
+        mixed_qkv=torch.empty(capacity * 16, 6),
         conv_state=torch.empty(8, 6, 6),
         recurrent_state=torch.empty(8, 1, 128, 128),
-        query_start_loc=torch.tensor([0, 32], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, capacity * 16], dtype=torch.int32),
         checkpoint=checkpoint,
         error_code=error,
     )
-    assert observed["grid"][0] == 2
+    assert observed["grid"][0] == capacity
     assert observed["args"][15] == 3
-    assert observed["args"][21] == 2
+    assert observed["args"][21] == capacity
     assert observed["args"][22] is error and observed["args"][23] is True
 
 
-@pytest.mark.parametrize("capacity", [1, 2])
+@pytest.mark.parametrize("capacity", [1, 2, 4])
 def test_prefill_warmup_binds_the_planned_checkpoint_capacity(monkeypatch, capacity):
     from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn as module
 
-    shape = (2, capacity) if capacity == 2 else (2,)
+    shape = (2, capacity) if capacity > 1 else (2,)
     observed = {}
 
     def bind(plan, **kwargs):
@@ -181,6 +188,6 @@ def test_prefill_warmup_binds_the_planned_checkpoint_capacity(monkeypatch, capac
         layer, (16,), torch.bfloat16
     )
     unit.compile()
-    expected = (1, 2) if capacity == 2 else (1,)
+    expected = (1, capacity) if capacity > 1 else (1,)
     assert observed["checkpoint_state_indices"].shape == expected
     assert observed["checkpoint_offsets"].shape == expected

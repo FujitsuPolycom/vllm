@@ -40,6 +40,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.recurrent_prefill_checkpoint import (
+    COALESCED_CHECKPOINT_CAPACITY,
     CheckpointPlan,
     continuation_layout,
     prefill_checkpoint_plan,
@@ -530,14 +531,31 @@ class Scheduler(SchedulerInterface):
                 if isinstance(group.kv_cache_spec, MambaSpec)
             ]
             if not recurrent_groups or any(
-                spec.num_prefill_checkpoint_blocks != 2
+                spec.num_prefill_checkpoint_blocks != COALESCED_CHECKPOINT_CAPACITY
                 or spec.block_size != self.cache_config.block_size
                 for spec in recurrent_groups
             ):
                 raise ValueError(
-                    "KDA coalescing requires two-checkpoint recurrent groups "
+                    "KDA coalescing requires four-checkpoint recurrent groups "
                     "on one block grid"
                 )
+            managers = self.kv_cache_manager.coordinator.single_type_managers
+            logger.info(
+                "KDA_PREFILL_COALESCING configured capacity=%d grids=%s "
+                "(physical, lookup, scheduler)",
+                COALESCED_CHECKPOINT_CAPACITY,
+                sorted(
+                    {
+                        (
+                            manager.block_size,
+                            manager.hit_alignment_tokens,
+                            manager.scheduler_block_size,
+                        )
+                        for manager in managers
+                        if isinstance(manager, MambaManager)
+                    }
+                ),
+            )
 
     def _recurrent_checkpoint_plan(
         self, request: Request, start: int, end: int
@@ -2147,6 +2165,13 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.compute_service_class,
                 contended=scheduler_output.compute_contention,
             )
+        if scheduler_output.recurrent_prefill_checkpoint_plans:
+            for plan in scheduler_output.recurrent_prefill_checkpoint_plans.values():
+                logger.info_once(
+                    "KDA_PREFILL_COALESCING scheduled span=%d checkpoints=%d",
+                    plan[1] - plan[0],
+                    len(plan[2]),
+                )
         return scheduler_output
 
     def record_compute_time(

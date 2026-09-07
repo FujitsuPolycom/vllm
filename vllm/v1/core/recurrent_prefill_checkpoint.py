@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 CheckpointPlan = tuple[int, int, tuple[int, ...]]
 
+# DCP4 retention preserves two fine-grid and two scheduler-grid states.
+COALESCED_CHECKPOINT_CAPACITY = 4
+
 
 def validate_plan(
     plan: CheckpointPlan, start: int, end: int, block_size: int
@@ -25,11 +28,11 @@ def validate_plan(
         )
     if (
         not isinstance(targets, tuple)
-        or not 1 <= len(targets) <= 2
+        or not 1 <= len(targets) <= COALESCED_CHECKPOINT_CAPACITY
         or targets != tuple(sorted(set(targets)))
     ):
         raise ValueError(
-            "recurrent checkpoint targets must be one or two sorted unique positions"
+            "recurrent checkpoint targets must be one to four sorted unique positions"
         )
     if any(
         type(p) is not int or not start < p < end or p % block_size or (p - start) % 16
@@ -76,7 +79,7 @@ def prefill_checkpoint_plan(
 def checkpoint_metadata(
     plan: CheckpointPlan | None, start: int, end: int, block_size: int, capacity: int
 ) -> tuple[list[int], list[int]]:
-    if capacity not in (1, 2):
+    if capacity not in (1, 2, COALESCED_CHECKPOINT_CAPACITY):
         raise ValueError("unsupported recurrent checkpoint capacity")
     if plan is not None:
         targets = validate_plan(plan, start, end, block_size)

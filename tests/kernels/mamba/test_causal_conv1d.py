@@ -518,7 +518,7 @@ def test_causal_conv1d_update_hoisted_spec_decode_is_bitwise(
     assert torch.isfinite(out_h.float()).all()
 
 
-@pytest.mark.parametrize("checkpoint_count", [1, 2])
+@pytest.mark.parametrize("checkpoint_count", [1, 2, 4])
 @pytest.mark.parametrize("metadata_error", [0, 1])
 def test_kda_checkpoint_history_excludes_speculative_cells(
     checkpoint_count, metadata_error
@@ -538,8 +538,16 @@ def test_kda_checkpoint_history_excludes_speculative_cells(
         64, width
     )
     state = torch.full((8, width, 6), -7.0, device=device)
-    offsets = torch.tensor([[16, 48]], dtype=torch.int32, device=device)
-    destinations = torch.tensor([[2, 5]], dtype=torch.int32, device=device)
+    offsets = torch.tensor(
+        [[16, 32, 48, 64]] if checkpoint_count == 4 else [[16, 48]],
+        dtype=torch.int32,
+        device=device,
+    )
+    destinations = torch.tensor(
+        [[2, 3, 4, 5]] if checkpoint_count == 4 else [[2, 5]],
+        dtype=torch.int32,
+        device=device,
+    )
     if checkpoint_count == 1:
         offsets = offsets[:, 0].contiguous()
         destinations = destinations[:, 0].contiguous()

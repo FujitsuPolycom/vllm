@@ -734,10 +734,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def _initialize_b12x_kda_prefill(self, vllm_config: VllmConfig) -> None:
         """Hold the b12x prefill op and its per-request metadata buffers."""
-        from vllm.v1.core.recurrent_prefill_checkpoint import validate_coalescing_config
+        from vllm.v1.core.recurrent_prefill_checkpoint import (
+            COALESCED_CHECKPOINT_CAPACITY,
+            validate_coalescing_config,
+        )
 
         coalescing = validate_coalescing_config(vllm_config)
-        self._b12x_prefill_checkpoint_capacity = 2 if coalescing else 1
+        self._b12x_prefill_checkpoint_capacity = (
+            COALESCED_CHECKPOINT_CAPACITY if coalescing else 1
+        )
         if self.kda_prefill_backend != "b12x":
             return
         api = get_b12x_kda_prefill()
@@ -749,7 +754,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if coalescing:
             if "max_checkpoints" not in getattr(api.Caps, "__dataclass_fields__", {}):
                 raise RuntimeError(
-                    "KDA coalescing requires B12X two-checkpoint support"
+                    "KDA coalescing requires B12X four-checkpoint support"
                 )
             properties = torch.cuda.get_device_properties(device)
             if (
@@ -763,7 +768,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_prefill_max_tokens = int(scheduler_config.max_num_batched_tokens)
         self._b12x_prefill_max_seqs = int(scheduler_config.max_num_seqs)
         max_seqs = self._b12x_prefill_max_seqs
-        checkpoint_shape = (max_seqs, 2) if coalescing else (max_seqs,)
+        checkpoint_shape = (
+            (max_seqs, self._b12x_prefill_checkpoint_capacity)
+            if coalescing
+            else (max_seqs,)
+        )
         self.register_buffer(
             "_b12x_prefill_num_seqs",
             torch.zeros(1, dtype=torch.int32, device=device),
@@ -812,12 +821,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 null_state_index=NULL_BLOCK_ID,
                 metadata_validation=(
                     "transactional"
-                    if self._b12x_prefill_checkpoint_capacity == 2
+                    if self._b12x_prefill_checkpoint_capacity > 1
                     else "trusted"
                 ),
                 **(
-                    {"max_checkpoints": 2}
-                    if self._b12x_prefill_checkpoint_capacity == 2
+                    {"max_checkpoints": self._b12x_prefill_checkpoint_capacity}
+                    if self._b12x_prefill_checkpoint_capacity > 1
                     else {}
                 ),
             )
@@ -941,7 +950,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             max_live_tokens=num_tokens,
             max_live_seqs=num_requests,
         )
-        if self._b12x_prefill_checkpoint_capacity == 2:
+        if self._b12x_prefill_checkpoint_capacity > 1:
             # Consumers share this stream and must not publish invalid states.
             torch._assert_async(
                 binding.error_code == 0, "invalid recurrent checkpoint metadata"
@@ -971,13 +980,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         indices = checkpoint.state_indices
         checkpoint_count = offsets.shape[1] if offsets.ndim == 2 else 1
         if (
-            checkpoint_count not in (1, 2)
+            checkpoint_count not in (1, 2, 4)
             or not offsets.is_contiguous()
             or not indices.is_contiguous()
         ):
             raise ValueError(
                 "Checkpoint convolution metadata must be contiguous "
-                "with capacity one or two"
+                "with capacity one, two or four"
             )
         if tuple(offsets.shape) != tuple(indices.shape):
             raise ValueError("Checkpoint offset and destination shapes differ")

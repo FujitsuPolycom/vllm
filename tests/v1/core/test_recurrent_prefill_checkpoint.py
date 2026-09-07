@@ -141,7 +141,7 @@ def test_explicit_coalescing_rejects_unsupported_configuration(
         validate_coalescing_config(config)
 
 
-def cache_fixture(prompt, speculative=3):
+def cache_fixture(prompt, speculative=3, *, checkpoints=4, dcp=4):
     from tests.v1.core.utils import create_requests
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -170,7 +170,7 @@ def cache_fixture(prompt, speculative=3):
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                     num_speculative_blocks=speculative,
-                    num_prefill_checkpoint_blocks=2,
+                    num_prefill_checkpoint_blocks=checkpoints,
                 ),
             ),
         ],
@@ -182,6 +182,7 @@ def cache_fixture(prompt, speculative=3):
         hash_block_size=512,
         enable_caching=True,
         use_eagle=True,
+        dcp_world_size=dcp,
     )
     (request,) = create_requests(1, num_tokens=prompt, block_size=512)
     scheduler = Scheduler.__new__(Scheduler)
@@ -193,7 +194,7 @@ def cache_fixture(prompt, speculative=3):
     scheduler.max_num_scheduled_tokens = 8192
     scheduler.scheduler_config = NS(long_prefill_token_threshold=0)
     scheduler.mamba_has_prefill_checkpoint_blocks = True
-    scheduler.mamba_partial_cache_hit = False
+    scheduler.mamba_partial_cache_hit = cache.coordinator.enable_partial_hash_hits
     scheduler.hash_block_size = 512
     scheduler.drop_last_prefix_cache_block = True
     scheduler.use_eagle = True
@@ -289,7 +290,7 @@ def test_full_prompt_admission_reserves_checkpoint_peak_for_internal_8k_chunk():
         peak = manager.get_num_blocks_to_allocate(
             request.request_id, 10240, [], 0, 0, 10240, apply_admission_cap=True
         )
-        assert peak == 7
+        assert peak == 9
         assert request.request_id not in manager._num_checkpoint_blocks
     finally:
         manager._planned_recurrent_checkpoints.clear()
@@ -299,3 +300,39 @@ def test_full_prompt_admission_reserves_checkpoint_peak_for_internal_8k_chunk():
     assert result is not None
     assert manager._planned_recurrent_checkpoints == {}
     assert not manager.req_to_blocks[request.request_id][11].is_null
+
+
+@pytest.mark.parametrize("prompt", [8192, 16384, 32768])
+def test_dcp4_retains_fine_and_scheduler_grid_states_without_extra_passes(prompt):
+    cache, manager, scheduler, request = cache_fixture(prompt)
+    assert manager.hit_alignment_tokens == 512
+    assert manager.scheduler_block_size == 2048
+    expected = (prompt - 4096, prompt - 2048, prompt - 1024, prompt - 512)
+    assert tuple(sorted(manager._expand_reachable_boundaries([prompt - 1]))) == expected
+    start = prompt - 8192
+    if start:
+        while request.num_computed_tokens < start:
+            assert cache.allocate_slots(request, 8192) is not None
+            if request.num_computed_tokens == 0:
+                scheduler._record_coalescing_origin(request, 0, 0, 0, False)
+            request.num_computed_tokens += 8192
+    plan = scheduler._recurrent_checkpoint_plan(request, start, prompt)
+    assert plan == (start, prompt, expected)
+    assert scheduler._mamba_block_aligned_split(request, 8192) == 8192
+    assert (
+        cache.allocate_slots(
+            request, 8192, num_lookahead_tokens=3, recurrent_checkpoint_plan=plan
+        )
+        is not None
+    )
+    blocks = manager.req_to_blocks[request.request_id]
+    columns = [p // 512 - 1 for p in expected] + [prompt // 512 - 1]
+    assert all(not blocks[column].is_null for column in columns)
+    assert len({blocks[column].block_id for column in columns}) == len(columns)
+
+
+def test_two_checkpoint_capacity_keeps_safe_dcp4_fallback():
+    _, manager, scheduler, request = cache_fixture(8192, checkpoints=2)
+    assert manager.hit_alignment_tokens == 512
+    assert scheduler._recurrent_checkpoint_plan(request, 0, 8192) is None
+    assert scheduler._mamba_block_aligned_split(request, 8192) == 4096
