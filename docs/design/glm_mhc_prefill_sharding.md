@@ -2,8 +2,15 @@
 
 Status: **research-only**. The implementation moves repeated mHC work onto each
 tensor-parallel rank's token quarter during eligible eager prefills. CPU tests
-cover admission and actual model/projection/MoE call boundaries; this maintained
-source port has no GPU or full-model evaluation result.
+cover admission and actual model/projection/MoE call boundaries. GLM-5.3-Flash
+serving checks on four GB10 GPUs with TP4/DCP4 verified eligible request dispatch,
+quarter-token geometry, and completed exact-answer/cache-reuse requests with
+continuation coalescing enabled and disabled. The four-arm comparison completed
+three cold samples per 8K/16K/32K prefill size and four 20-second decode cells per
+arm without reported request errors. With coalescing disabled, measured 8K
+prompts had no eligible mHC forward; 16K/32K prompts had one/three eligible
+8,192-row forwards. These bounded checks do not establish model-quality
+equivalence or long-duration reliability.
 
 ## Activation and scope
 

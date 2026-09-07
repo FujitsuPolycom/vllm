@@ -1,0 +1,23 @@
+{
+  "schema": "glm-prefill-source-composition/v1",
+  "feature": "Token-sharded mHC prefill",
+  "feature_source_head": "ebd2fb9100b4c50555fea42105716912e67aa7d1",
+  "vllm_base": "2a979314dc97b03173a0a76fc15664ec924db32b",
+  "composition": {
+    "image_source": "abb715f132bdccb592a34b2596a3d3a8d757ffbc",
+    "merged_tree": "b92b08bdd69e24d17ea1795b70d1736749a444f0",
+    "different_paths_from_image_source": [
+      "docs/design/glm_mhc_prefill_sharding.md",
+      "docs/features/quantization/b12x.md"
+    ],
+    "vllm_subtree_in_both": "5f6b014449c94344bde776d086b0b895fad683ec",
+    "tests_subtree_in_both": "ee93b94ed702d40a8ff855987ff424f5b0210585",
+    "all_non_documentation_paths_identical": true,
+    "combined_checkout_unchanged": true,
+    "image_unchanged": true
+  },
+  "files": {
+    "report.md": "320b6b8da0b00204f6fab4ae7cbd6f69363dd2b9190a56602d8ad689f2db17d1",
+    "evidence.json": "df0c6d9d491f1c9233b0711442757e3331bf8bbb485ae3cdc45b0018593cff62"
+  }
+}
