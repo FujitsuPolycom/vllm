@@ -1,6 +1,6 @@
 {
   "schema": "glm-prefill-four-arm-public-evidence/v1",
-  "exporter_sha256": "395284d9307a086f3e7924a88c9a836e17911425d39fcbdf8d3ec8dfd858dd9b",
+  "exporter_sha256": "290fede850bc4f296bd6b689e4dfcc3ef71a641bee23184a1b64ef61b16bf285",
   "status": "complete",
   "qualification": "bounded semantic/cache smoke checks and performance observations; not full numerical/model-quality qualification",
   "hardware": "four NVIDIA GB10 Sparks",
