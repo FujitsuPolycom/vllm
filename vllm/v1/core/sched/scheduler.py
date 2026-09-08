@@ -557,6 +557,25 @@ class Scheduler(SchedulerInterface):
                 ),
             )
 
+    def _kda_coalescing_prefill_exclusive(self) -> bool:
+        """True when at most one request still has prompt tokens to compute.
+
+        Checkpoint plans are built per request and the worker maps them by
+        packed row, so decoding requests may share the step with the one
+        prefilling request. Two requests with prompt work in flight keep the
+        ordinary aligned splitting, as before.
+        """
+        if not self._kda_coalescing_enabled:
+            return False
+        prefilling = 0
+        for queue in (self.running, self.waiting, self.skipped_waiting):
+            for request in queue:
+                if request.num_computed_tokens < request.num_prompt_tokens:
+                    prefilling += 1
+                    if prefilling > 1:
+                        return False
+        return True
+
     def _recurrent_checkpoint_plan(
         self, request: Request, start: int, end: int
     ) -> CheckpointPlan | None:
@@ -890,10 +909,7 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
-        self._kda_coalescing_exclusive = (
-            self._kda_coalescing_enabled
-            and len(self.running) + len(self.waiting) + len(self.skipped_waiting) == 1
-        )
+        self._kda_coalescing_exclusive = self._kda_coalescing_prefill_exclusive()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
