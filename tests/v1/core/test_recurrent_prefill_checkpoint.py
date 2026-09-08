@@ -120,11 +120,19 @@ def test_coalescing_default_off_does_not_require_model_capabilities(monkeypatch)
     assert not validate_coalescing_config(object())
 
 
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_coalescing_accepts_context_groups_within_tp4(monkeypatch, dcp):
+    monkeypatch.setenv("VLLM_B12X_KDA_PREFILL_COALESCING", "1")
+    config = supported_config()
+    config.parallel_config.decode_context_parallel_size = dcp
+    assert validate_coalescing_config(config)
+
+
 @pytest.mark.parametrize(
     "section,field,value",
     [
         ("parallel_config", "tensor_parallel_size", 2),
-        ("parallel_config", "decode_context_parallel_size", 1),
+        ("parallel_config", "decode_context_parallel_size", 3),
         ("scheduler_config", "max_num_batched_tokens", 4096),
         ("cache_config", "prefix_cache_retention_interval", 2048),
         ("model_config", "dtype", torch.float16),
@@ -144,6 +152,7 @@ def test_explicit_coalescing_rejects_unsupported_configuration(
 def cache_fixture(prompt, speculative=3, *, checkpoints=4, dcp=4):
     from tests.v1.core.utils import create_requests
     from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
     from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -175,11 +184,22 @@ def cache_fixture(prompt, speculative=3, *, checkpoints=4, dcp=4):
             ),
         ],
     )
+    scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        config,
+        NS(
+            cache_config=NS(
+                block_size=512, enable_prefix_caching=True, prefix_match_unit=None
+            ),
+            parallel_config=NS(decode_context_parallel_size=dcp),
+            kv_transfer_config=None,
+        ),
+    )
+    assert (scheduler_block_size, hash_block_size) == (512 * dcp, 512)
     cache = KVCacheManager(
         config,
         max_model_len=131072,
-        scheduler_block_size=2048,
-        hash_block_size=512,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
         enable_caching=True,
         use_eagle=True,
         dcp_world_size=dcp,
@@ -203,12 +223,13 @@ def cache_fixture(prompt, speculative=3, *, checkpoints=4, dcp=4):
 
 @pytest.mark.parametrize("prompt", [8192, 10240, 16384, 32768])
 @pytest.mark.parametrize("speculative", [0, 3])
+@pytest.mark.parametrize("dcp", [1, 2, 4])
 def test_scheduler_and_allocator_keep_8k_chunks_and_worker_column_ownership(
-    prompt, speculative
+    prompt, speculative, dcp
 ):
     from vllm.v1.request import RequestStatus
 
-    cache, manager, scheduler, request = cache_fixture(prompt, speculative)
+    cache, manager, scheduler, request = cache_fixture(prompt, speculative, dcp=dcp)
     worker: list[KVCacheBlock] = []
     chunks = []
     while request.num_computed_tokens < prompt:
@@ -246,8 +267,11 @@ def test_scheduler_and_allocator_keep_8k_chunks_and_worker_column_ownership(
     )
 
 
-def test_continuation_admission_failure_releases_only_its_temporary_plan(monkeypatch):
-    cache, manager, scheduler, request = cache_fixture(16384)
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_continuation_admission_failure_releases_only_its_temporary_plan(
+    monkeypatch, dcp
+):
+    cache, manager, scheduler, request = cache_fixture(16384, dcp=dcp)
     assert cache.allocate_slots(request, 8192) is not None
     scheduler._record_coalescing_origin(request, 0, 0, 0, False)
     request.num_computed_tokens = 8192
@@ -260,8 +284,9 @@ def test_continuation_admission_failure_releases_only_its_temporary_plan(monkeyp
     assert tuple(manager.req_to_blocks[request.request_id]) == retained
 
 
-def test_cache_hit_preemption_and_shared_speculative_slots_disable_coalescing():
-    cache, manager, scheduler, request = cache_fixture(16384)
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_cache_hit_preemption_and_shared_speculative_slots_disable_coalescing(dcp):
+    cache, manager, scheduler, request = cache_fixture(16384, dcp=dcp)
     assert cache.allocate_slots(request, 8192) is not None
     request.num_computed_tokens = 8192
     assert scheduler._recurrent_checkpoint_plan(request, 8192, 16384) is None
@@ -303,11 +328,13 @@ def test_full_prompt_admission_reserves_checkpoint_peak_for_internal_8k_chunk():
 
 
 @pytest.mark.parametrize("prompt", [8192, 16384, 32768])
-def test_dcp4_retains_fine_and_scheduler_grid_states_without_extra_passes(prompt):
-    cache, manager, scheduler, request = cache_fixture(prompt)
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_dcp_geometry_retains_required_states_without_extra_passes(prompt, dcp):
+    cache, manager, scheduler, request = cache_fixture(prompt, dcp=dcp)
     assert manager.hit_alignment_tokens == 512
-    assert manager.scheduler_block_size == 2048
-    expected = (prompt - 4096, prompt - 2048, prompt - 1024, prompt - 512)
+    assert manager.scheduler_block_size == 512 * dcp
+    offsets = {1: (1024, 512), 2: (2048, 1024, 512), 4: (4096, 2048, 1024, 512)}
+    expected = tuple(prompt - offset for offset in offsets[dcp])
     assert tuple(sorted(manager._expand_reachable_boundaries([prompt - 1]))) == expected
     start = prompt - 8192
     if start:

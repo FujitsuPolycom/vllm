@@ -179,7 +179,7 @@ def validate_coalescing_config(config: VllmConfig) -> bool:
         and not model.enable_sleep_mode
         and not model.enable_return_routed_experts
         and parallel.tensor_parallel_size == 4
-        and parallel.decode_context_parallel_size == 4
+        and parallel.decode_context_parallel_size in (1, 2, 4)
         and parallel.pipeline_parallel_size == 1
         and parallel.data_parallel_size == 1
         and parallel.prefill_context_parallel_size == 1
@@ -208,7 +208,7 @@ def validate_coalescing_config(config: VllmConfig) -> bool:
     if not supported:
         raise ValueError(
             "VLLM_B12X_KDA_PREFILL_COALESCING requires GLM5Next BF16, V2, "
-            "TP4/DCP4/PP1/DP1, B12X KDA, an 8192-token scheduler budget, "
+            "TP4 with DCP1/2/4, PP1/DP1, B12X KDA, an 8192-token scheduler budget, "
             "align-mode prefix caching with retention interval 0, and static "
             "MTP3 or no speculation; LoRA, EP, PCP and fairness engines are unsupported"
         )
