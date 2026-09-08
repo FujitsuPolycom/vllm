@@ -432,6 +432,27 @@ def test_dcp4_unaligned_prompt_tail_coalesces_into_one_chunk(prompt):
     assert len({blocks[column].block_id for column in columns}) == len(columns)
 
 
+def test_coalescing_stays_exclusive_to_prompt_work_not_to_decodes():
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kda_coalescing_enabled = True
+    prefill = NS(num_computed_tokens=0, num_prompt_tokens=16228)
+    decode = NS(num_computed_tokens=8300, num_prompt_tokens=8192)
+    scheduler.running = [decode, decode, prefill]
+    scheduler.waiting = []
+    scheduler.skipped_waiting = []
+    assert scheduler._kda_coalescing_prefill_exclusive()
+    scheduler.waiting = [NS(num_computed_tokens=0, num_prompt_tokens=4096)]
+    assert not scheduler._kda_coalescing_prefill_exclusive()
+    scheduler.waiting = []
+    scheduler.running = [prefill, NS(num_computed_tokens=8192, num_prompt_tokens=12288)]
+    assert not scheduler._kda_coalescing_prefill_exclusive()
+    scheduler._kda_coalescing_enabled = False
+    scheduler.running = [prefill]
+    assert not scheduler._kda_coalescing_prefill_exclusive()
+
+
 def test_two_checkpoint_capacity_keeps_safe_dcp4_fallback():
     _, manager, scheduler, request = cache_fixture(8192, checkpoints=2)
     assert manager.hit_alignment_tokens == 512
