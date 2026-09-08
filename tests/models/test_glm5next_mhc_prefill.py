@@ -125,7 +125,9 @@ def test_unsupported_hardware_rejects_all_ranks(
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("decode_context_parallel_size", 1),
+        ("tensor_parallel_size", 2),
+        ("decode_context_parallel_size", 3),
+        ("decode_context_parallel_size", 8),
         ("pipeline_parallel_size", 2),
         ("data_parallel_size", 2),
         ("prefill_context_parallel_size", 2),
@@ -138,6 +140,60 @@ def test_unsupported_parallel_config_is_rejected(admission, field, value):
     setattr(admission.config.parallel_config, field, value)
     with pytest.raises(RuntimeError, match="configuration admission"):
         ownership.configure(admission.model, admission.config, True)
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+@pytest.mark.parametrize("rank", range(4))
+def test_dcp_keeps_tp_communicator_and_quarter_token_ownership(
+    monkeypatch, admission, dcp, rank
+):
+    """DCP subgroups must not replace TP rank ordering or its collective group."""
+    from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
+
+    admission.config.parallel_config.decode_context_parallel_size = dcp
+    admission.group.rank_in_group = rank
+    comm = admission.group.device_communicator.pynccl_comm
+    comm.rank = rank
+    monkeypatch.setattr(
+        distributed,
+        "get_dcp_group",
+        lambda: pytest.fail("Token ownership must use the TP group"),
+    )
+    projection = linear.RowParallelLinear.__new__(linear.RowParallelLinear)
+    torch.nn.Module.__init__(projection)
+    projection.tp_size, projection.reduce_results, projection.bias = 4, True, None
+    attn = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(attn)
+    attn.prefix, attn.o_proj = "gdn", projection
+    admission.model.is_sequence_parallel = False
+    admission.model._active_layers = [
+        NS(
+            mhc=True,
+            is_mtp_layer=False,
+            _b12x_mhc=object(),
+            self_attn=attn,
+            _mlp_is_moe=False,
+            mlp=NS(down_proj=projection),
+        )
+    ]
+    ownership.configure(admission.model, admission.config, True)
+    assert ownership.validate_model(admission.model) == ("gdn",)
+    context = NS(
+        cudagraph_runtime_mode=NS(name="NONE"),
+        ubatch_slices=None,
+        attn_metadata={"gdn": metadata()},
+    )
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    hidden = NS(
+        shape=(8192, 4096), is_cuda=True, dtype=torch.bfloat16, device=comm.device
+    )
+    owner = ownership.maybe_create(admission.model, hidden, NS(shape=(8192,)))
+    assert owner is not None and owner.comm is comm and owner.rank == rank
+    values = torch.arange(8192).reshape(8192, 1)
+    assert torch.equal(
+        owner.local_view(values), values[rank * 2048 : (rank + 1) * 2048]
+    )
 
 
 def test_rank_flag_disagreement_rejects_disabled_rank(monkeypatch, admission):
@@ -340,9 +396,11 @@ class CPUOwner:
         assert self.mhc_calls.count(("final_post", 2)) == 1
 
 
+@pytest.mark.parametrize("dcp", [1, 2, 4])
 def test_model_preserves_full_final_auxiliary_and_owner_residual_boundaries(
-    monkeypatch,
+    monkeypatch, dcp
 ):
+    """Completed DCP attention must feed one TP partial into row ownership."""
     monkeypatch.setattr(
         glm, "get_pp_group", lambda: NS(is_first_rank=True, is_last_rank=True)
     )
@@ -396,7 +454,11 @@ def test_model_preserves_full_final_auxiliary_and_owner_residual_boundaries(
 
                 def attention(hidden_states, positions, *, defer_tp_reduction=False):
                     assert hidden_states.shape == (8, 4) and positions.shape == (8,)
-                    partial = hidden_states * ((rank + 1) / 16)
+                    context_partials = [
+                        hidden_states * ((rank + 1) / (16 * dcp)) for _ in range(dcp)
+                    ]
+                    partial = torch.stack(context_partials).sum(0)
+                    assert torch.equal(partial, hidden_states * ((rank + 1) / 16))
                     return (
                         partial
                         if defer_tp_reduction

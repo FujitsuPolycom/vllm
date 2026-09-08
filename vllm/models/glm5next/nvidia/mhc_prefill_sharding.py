@@ -120,7 +120,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
             parallel = config.parallel_config
             if (
                 parallel.tensor_parallel_size != 4
-                or parallel.decode_context_parallel_size != 4
+                or parallel.decode_context_parallel_size not in (1, 2, 4)
                 or parallel.pipeline_parallel_size != 1
                 or parallel.data_parallel_size != 1
                 or parallel.prefill_context_parallel_size != 1
@@ -132,7 +132,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
             ):
                 raise RuntimeError(
                     "GLM mHC row ownership requires BF16 H4096 and "
-                    "TP4/DCP4/PP1/DP1/PCP1 without expert or sequence parallelism"
+                    "TP4/DCP1,2,4/PP1/DP1/PCP1 without expert or sequence parallelism"
                 )
             properties = torch.cuda.get_device_properties(
                 torch.accelerator.current_device_index()
@@ -223,7 +223,7 @@ def validate_model(model: Any) -> tuple[str, ...]:
     config = model._mhc_prefill_parallel_config
     if (
         config.tensor_parallel_size != 4
-        or config.decode_context_parallel_size != 4
+        or config.decode_context_parallel_size not in (1, 2, 4)
         or config.pipeline_parallel_size != 1
         or config.data_parallel_size != 1
         or config.prefill_context_parallel_size != 1
@@ -231,7 +231,9 @@ def validate_model(model: Any) -> tuple[str, ...]:
         or config.enable_eplb
         or model.is_sequence_parallel
     ):
-        raise RuntimeError("mHC prefill requires TP4/DCP4/PP1/DP1/PCP1 without EP/EPLB")
+        raise RuntimeError(
+            "mHC prefill requires TP4/DCP1,2,4/PP1/DP1/PCP1 without EP/EPLB"
+        )
     names = []
     for layer in model._active_layers:
         if not layer.mhc or layer.is_mtp_layer or layer._b12x_mhc is None:
