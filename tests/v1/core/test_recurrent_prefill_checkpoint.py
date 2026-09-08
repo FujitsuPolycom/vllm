@@ -46,7 +46,7 @@ def test_fresh_and_continuation_plans_export_exact_retained_boundaries():
     )
 
 
-@pytest.mark.parametrize("end", [8193, 16385, 24576])
+@pytest.mark.parametrize("end", [8193, 24576])
 def test_unrepresentable_or_over_budget_final_spans_use_ordinary_splitting(end):
     assert (
         prefill_checkpoint_plan(
@@ -58,6 +58,46 @@ def test_unrepresentable_or_over_budget_final_spans_use_ordinary_splitting(end):
             publications=(14336,),
         )
         is None
+    )
+
+
+def test_unaligned_prompt_end_coalesces_only_as_the_final_span():
+    publications = (12288, 14336, 15360, 15872)
+    assert prefill_checkpoint_plan(
+        start=8192,
+        end=16228,
+        prompt=16228,
+        num_tokens=16228,
+        block_size=512,
+        publications=publications,
+    ) == (8192, 16228, publications)
+    # An unaligned end that is not the prompt end still splits ordinarily.
+    assert (
+        prefill_checkpoint_plan(
+            start=8192,
+            end=16000,
+            prompt=16228,
+            num_tokens=16228,
+            block_size=512,
+            publications=publications,
+        )
+        is None
+    )
+    # A single-token tail has no interior state to retain.
+    assert (
+        prefill_checkpoint_plan(
+            start=16384,
+            end=16385,
+            prompt=16385,
+            num_tokens=16385,
+            block_size=512,
+            publications=(14336, 15872, 16384),
+        )
+        is None
+    )
+    assert checkpoint_metadata((8192, 16228, publications), 8192, 16228, 512, 4) == (
+        [4096, 6144, 7168, 7680],
+        [23, 27, 29, 30],
     )
 
 
@@ -354,6 +394,40 @@ def test_dcp_geometry_retains_required_states_without_extra_passes(prompt, dcp):
     )
     blocks = manager.req_to_blocks[request.request_id]
     columns = [p // 512 - 1 for p in expected] + [prompt // 512 - 1]
+    assert all(not blocks[column].is_null for column in columns)
+    assert len({blocks[column].block_id for column in columns}) == len(columns)
+
+
+@pytest.mark.parametrize("prompt", [16228, 16383, 32319, 6244])
+def test_dcp4_unaligned_prompt_tail_coalesces_into_one_chunk(prompt):
+    cache, manager, scheduler, request = cache_fixture(prompt)
+    start = (prompt - 1) // 8192 * 8192
+    expected = tuple(
+        sorted(
+            p
+            for p in manager._expand_reachable_boundaries([prompt - 1])
+            if start < p < prompt
+        )
+    )
+    assert 1 <= len(expected) <= 4
+    if start:
+        while request.num_computed_tokens < start:
+            assert cache.allocate_slots(request, 8192) is not None
+            if request.num_computed_tokens == 0:
+                scheduler._record_coalescing_origin(request, 0, 0, 0, False)
+            request.num_computed_tokens += 8192
+    tail = prompt - start
+    plan = scheduler._recurrent_checkpoint_plan(request, start, prompt)
+    assert plan == (start, prompt, expected)
+    assert scheduler._mamba_block_aligned_split(request, tail) == tail
+    assert (
+        cache.allocate_slots(
+            request, tail, num_lookahead_tokens=3, recurrent_checkpoint_plan=plan
+        )
+        is not None
+    )
+    blocks = manager.req_to_blocks[request.request_id]
+    columns = [p // 512 - 1 for p in expected] + [(prompt - 1) // 512]
     assert all(not blocks[column].is_null for column in columns)
     assert len({blocks[column].block_id for column in columns}) == len(columns)
 

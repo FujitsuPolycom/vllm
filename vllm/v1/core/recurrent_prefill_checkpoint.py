@@ -54,14 +54,21 @@ def prefill_checkpoint_plan(
     publications: tuple[int, ...],
     shared_prefix_boundary: int = 0,
 ) -> CheckpointPlan | None:
-    """Export exact retained states inside a bounded pure-prompt chunk."""
+    """Export exact retained states inside a bounded pure-prompt chunk.
+
+    The span must start on a block boundary and end either on a block
+    boundary or at the prompt end. A prompt whose length is not a block
+    multiple therefore coalesces its final chunk too: the interior retained
+    states are exported in the same pass and the final state lands in the
+    tail block, exactly as an ordinary unaligned final chunk stores it.
+    """
     if (
         start < 0
         or start % block_size
         or not start < end <= prompt
         or num_tokens != prompt
         or end - start > 8192
-        or end % block_size
+        or (end % block_size and end != prompt)
     ):
         return None
     required = {position for position in publications if start < position < end}
@@ -113,12 +120,12 @@ def continuation_layout(
     """
     start, end, targets = plan
     validate_plan(plan, start, end, block_size)
-    if start <= 0 or start % block_size or end % block_size:
-        raise ValueError(
-            "continuation requires aligned nonzero source and final states"
-        )
+    if start <= 0 or start % block_size:
+        raise ValueError("continuation requires an aligned nonzero source state")
     source = start // block_size - 1
-    final = end // block_size - 1
+    # The final state occupies the block holding the last token, so an
+    # unaligned prompt end maps to the same column an ordinary tail uses.
+    final = (end - 1) // block_size
     if speculative_blocks < 0 or len(blocks) != source + 1 + speculative_blocks:
         raise ValueError("continuation table does not end at its expected reserve")
     if blocks[source].is_null or blocks[source].ref_cnt < 1:
