@@ -4,7 +4,7 @@ import itertools
 import math
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -1106,7 +1106,7 @@ class Scheduler(SchedulerInterface):
         def schedule_running_requests(
             service_class: ComputeServiceClass | None = None,
             *,
-            allow_preemption: bool = True,
+            allow_preemption: bool | Callable[[], bool] = True,
             enforce_lora_limit: bool = False,
         ) -> None:
             nonlocal draft_input_budget
@@ -1295,9 +1295,14 @@ class Scheduler(SchedulerInterface):
                         ):
                             break
 
-                        if not allow_preemption:
-                            # Leftover service must not evict work selected and
-                            # admitted earlier in this model step.
+                        preemption_allowed = (
+                            allow_preemption()
+                            if callable(allow_preemption)
+                            else allow_preemption
+                        )
+                        if not preemption_allowed:
+                            # Leftover service must not evict work selected
+                            # and admitted earlier in this model step.
                             break
 
                         # The request cannot be scheduled.
@@ -2092,7 +2097,14 @@ class Scheduler(SchedulerInterface):
         if adaptive_prefill_turn and token_budget > 0:
             schedule_running_requests(
                 "decode",
-                allow_preemption=False,
+                # Empty-quantum escape (#733): a prefill turn that scheduled
+                # nothing must not strand runnable decodes at a full pool, or
+                # the uncharged quantum reselects prefill forever. Allow the
+                # normal preemption path, but only while this step is still
+                # empty, so the escape can never evict work that the current
+                # batch already admitted or scheduled. Deferred block frees
+                # and stale output are handled by _preempt_request as usual.
+                allow_preemption=lambda: not num_scheduled_tokens,
                 enforce_lora_limit=True,
             )
 
