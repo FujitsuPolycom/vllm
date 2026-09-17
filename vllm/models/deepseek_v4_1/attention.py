@@ -43,6 +43,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
+    B12xPlanResolver,
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
@@ -545,7 +546,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 for param in linear.parameters():
                     set_weight_attrs(param, {"allow_tp_padding": True})
         self._wo_projection_weights = None
-        self._wo_plans = {}
+        self._wo_resolver = B12xPlanResolver("V4.1 WO projection")
         for linear in (self.fused_wqa_wkv, self.wq_b):
             _native_linear(linear)
         self.rotary_emb = build_deepseek_v4_rope(
@@ -1630,31 +1631,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 owners=(weights, table),
             )
 
-        requests = []
-        decode_rows = self._attention_declarations["decode"].query.query_rows
-        token_counts = tuple(
-            sorted(
-                {
-                    *self._preparation_token_counts(workload),
-                    *range(1, decode_rows + 1),
-                }
-            )
+        token_counts = self._preparation_token_counts(workload)
+        self._wo_resolver.declare_capacities(
+            fixed_counts=token_counts,
+            capacities=(self.capacity,),
+            exact=lambda rows: self._declare_wo_plan(rows, is_prefill=False),
+            capacity=lambda rows: self._declare_wo_plan(rows, is_prefill=True),
         )
-        for rows in token_counts:
-            requests.append(
-                self._wo_plan(rows).request(
-                    name=f"{self.prefix}.wo.m{rows}",
-                    prepare_call=prepare,
-                    benchmark_call=prepare,
-                )
-            )
-        requests.append(
-            self._wo_plan(self.capacity, is_prefill=True).request(
-                name=f"{self.prefix}.wo.prefill",
-                prepare_call=prepare,
-                benchmark_call=prepare,
-            )
-        )
+        requests = [
+            self._wo_resolver.resolve(rows).request(
+                name=f"{self.prefix}.wo.m{rows}", prepare_call=prepare, benchmark_call=prepare,
+            ) for rows in token_counts
+        ]
+        requests.append(self._wo_resolver.resolve(self.capacity).request(
+            name=f"{self.prefix}.wo.prefill", prepare_call=prepare, benchmark_call=prepare,
+        ))
         return B12xPreparationUnit(
             name="V41WOProjection",
             key=(self.prefix, token_counts),
@@ -1662,24 +1653,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             stage="weights",
         )
 
-    def _wo_plan(self, rows: int, *, is_prefill: bool = False):
-        key = "prefill" if is_prefill else rows
-        planned_rows = self.capacity if is_prefill else rows
-        if key not in self._wo_plans:
-            weights = self._wo_projection_weights
-            if weights is None:
-                raise PreparationResourceUnavailableError(
-                    "V4.1 WO weights are not packed"
-                )
-            table = self.rotary_emb.cos_sin_cache
-            self._wo_plans[key] = wo_projection.plan(
+    def _declare_wo_plan(self, rows: int, *, is_prefill: bool):
+        weights = self._wo_projection_weights
+        if weights is None:
+            raise PreparationResourceUnavailableError("V4.1 WO weights are not packed")
+        table = self.rotary_emb.cos_sin_cache
+        return wo_projection.plan(
                 wo_projection.Caps(
-                    device=table.device,
-                    max_tokens=planned_rows,
-                    groups=weights.groups,
-                    group_width=weights.group_width,
-                    rank=weights.rank,
-                    hidden=weights.hidden,
+                    device=table.device, max_tokens=rows, groups=weights.groups,
+                    group_width=weights.group_width, rank=weights.rank, hidden=weights.hidden,
                 ),
                 invocation=dict(
                     operation="inv_rope",
@@ -1691,7 +1673,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     cos_sin_dtype=str(table.dtype).removeprefix("torch."),
                 ),
             )
-        return self._wo_plans[key]
+
+    def _wo_plan(self, rows: int, *, is_prefill: bool = False):
+        del is_prefill
+        return self._wo_resolver.resolve(rows)
 
     def _o_proj(self, o, positions, *, is_prefill=False):
         from b12x.preparation import require_prepared
