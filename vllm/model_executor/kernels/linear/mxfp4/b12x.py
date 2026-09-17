@@ -7,13 +7,17 @@ from collections.abc import Sequence
 
 import torch
 
+from vllm.model_executor.kernels.linear.b12x_blockscaled import (
+    declare_regimes,
+    declared_plan,
+    regime_unit,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
-    PreparationResourceUnavailableError,
     b12x_layer,
     b12x_layer_prefix,
     register_b12x_layer,
@@ -35,13 +39,27 @@ from vllm.utils.torch_utils import (
 from .base import MxFp4LinearKernel, MxFp4LinearLayerConfig
 
 
-def _plan(layer: torch.nn.Module, tokens: int):
-    try:
-        return layer.b12x_mxfp4_plans[tokens]
-    except (AttributeError, KeyError):
-        raise PreparationResourceUnavailableError(
-            f"MXFP4 layer has no declared plan for exact M={tokens}"
-        ) from None
+def _mxfp4_plan(layer: torch.nn.Module, workload: B12xWorkload):
+    """The layer's regime plan, declared once from the first workload."""
+
+    def declare(capacity: int):
+        api = _import_b12x_blockscaled()
+        assert api is not None
+        n, packed_k = map(int, layer.weight.shape)
+        query = api.FixedBlockscaledQuery(
+            recipe="mxfp4",
+            call_kind="serialized",
+            max_rows=capacity,
+            in_features=packed_k * 2,
+            padded_in_features=packed_k * 2,
+            out_features=n,
+            input_dtype="uint8",
+            output_dtype=str(workload.output_dtype).removeprefix("torch."),
+            expected_m=None,
+        )
+        return api.plan_regimes(query, exact_m=workload.fixed_token_counts)
+
+    return declare_regimes(layer, "b12x_mxfp4_regimes", workload, declare)
 
 
 def _b12x_mxfp4_linear(
@@ -53,7 +71,7 @@ def _b12x_mxfp4_linear(
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer = b12x_layer(_resolve_layer_name(layer_name))
-    plan = _plan(layer, int(x_packed.shape[0]))
+    plan = declared_plan(layer, "b12x_mxfp4_regimes")
     blockscaled = _import_b12x_blockscaled()
     assert blockscaled is not None
     output = blockscaled.mm_mxfp4(
@@ -160,7 +178,9 @@ class B12xMxFp4LinearKernel(MxFp4LinearKernel):
         name = b12x_layer_prefix(layer)
         layer.b12x_layer_name = _encode_layer_name(name)
         register_b12x_layer(name, layer)
-        layer.b12x_mxfp4_plans = {}
+        # A reload keeps the declared regimes: they describe the layer's
+        # geometry, and the weights are passed to every call.
+        layer.b12x_mxfp4_regimes = getattr(layer, "b12x_mxfp4_regimes", None)
         if not getattr(layer, "b12x_preparation_suppressed", False):
             set_b12x_preparation_provider(layer, self)
 
@@ -172,30 +192,14 @@ class B12xMxFp4LinearKernel(MxFp4LinearKernel):
         weight, scales = layer.weight, layer.weight_scale
         if weight.is_meta or scales.is_meta:
             return ()
-        blockscaled = _import_b12x_blockscaled()
-        assert blockscaled is not None
-        n, packed_k = map(int, weight.shape)
+        packed_k = int(weight.shape[1])
         prefix = _resolve_layer_name(layer.b12x_layer_name)
-        plans = layer.b12x_mxfp4_plans
-        requests = []
-        for tokens in workload.token_counts:
-            plan = plans.get(tokens)
-            if plan is None:
-                query = blockscaled.FixedBlockscaledQuery(
-                    recipe="mxfp4",
-                    call_kind="serialized",
-                    max_rows=tokens,
-                    in_features=packed_k * 2,
-                    padded_in_features=packed_k * 2,
-                    out_features=n,
-                    input_dtype="uint8",
-                    output_dtype=str(workload.output_dtype).removeprefix("torch."),
-                    expected_m=tokens,
-                )
-                plan = blockscaled.plan(query)
-                plans[tokens] = plan
+        out_dtype = workload.output_dtype
+        c_dtype = str(out_dtype).removeprefix("torch.")
+        plan = _mxfp4_plan(layer, workload)
 
-            def call(state, *, rows=tokens):
+        def call_for_rows(rows: int):
+            def call(state):
                 from b12x.preparation import PreparedCall
 
                 from vllm.utils.flashinfer import flashinfer_mxfp4_quantize
@@ -204,7 +208,7 @@ class B12xMxFp4LinearKernel(MxFp4LinearKernel):
                 # loaded weights and their swizzled scales are borrowed.
                 source = torch.empty(
                     (rows, packed_k * 2),
-                    dtype=workload.output_dtype,
+                    dtype=out_dtype,
                     device=weight.device,
                 )
                 quantized: list[torch.Tensor] = []
@@ -232,7 +236,7 @@ class B12xMxFp4LinearKernel(MxFp4LinearKernel):
                         None,
                         ab_dtype="float4_e2m1fn",
                         sf_dtype="float8_e8m0fnu",
-                        c_dtype=str(workload.output_dtype).removeprefix("torch."),
+                        c_dtype=c_dtype,
                         sf_vec_size=32,
                         block_fp8=False,
                         stream=None,
@@ -244,23 +248,9 @@ class B12xMxFp4LinearKernel(MxFp4LinearKernel):
                     owners=(weight, scales),
                 )
 
-            requests.append(
-                plan.request(
-                    name=f"linear.mxfp4.{prefix}.m{tokens}",
-                    prepare_call=call,
-                    benchmark_call=call,
-                )
-            )
-        if not requests:
-            return ()
-        return (
-            B12xPreparationUnit(
-                name="MXFP4",
-                key=(prefix, tuple(sorted(plans))),
-                requests=tuple(requests),
-                stage="weights",
-            ),
-        )
+            return call
+
+        return (regime_unit("MXFP4", prefix, plan, workload, out_dtype, call_for_rows),)
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None

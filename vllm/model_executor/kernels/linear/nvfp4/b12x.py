@@ -9,7 +9,12 @@ from dataclasses import replace
 import torch
 
 from vllm._custom_ops import scaled_fp4_quant
-from vllm.model_executor.kernels.linear.b12x_blockscaled import B12xBlockscaledLinear
+from vllm.model_executor.kernels.linear.b12x_blockscaled import (
+    B12xBlockscaledLinear,
+    declare_regimes,
+    declared_plan,
+    regime_unit,
+)
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
@@ -38,29 +43,28 @@ from vllm.utils.torch_utils import (
 from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 
 
-def _serialized_name(layer: torch.nn.Module, rows: int) -> str:
-    prefix = _resolve_layer_name(layer.b12x_layer_name)
-    return f"linear.nvfp4.{prefix}.serialized.m{rows}"
+def _serialized_plan(layer: torch.nn.Module, workload: B12xWorkload):
+    """The layer's serialized regime plan, declared once from the first workload."""
 
-
-def _declare_serialized_plan(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
-    api = _import_b12x_blockscaled()
-    assert api is not None
-    packed = layer.b12x_nvfp4_packed_weight
-    return api.plan(
-        api.FixedBlockscaledQuery(
+    def declare(capacity: int):
+        api = _import_b12x_blockscaled()
+        assert api is not None
+        packed = layer.b12x_nvfp4_packed_weight
+        query = api.FixedBlockscaledQuery(
             recipe="nvfp4",
             call_kind="serialized",
-            max_rows=rows,
+            max_rows=capacity,
             in_features=packed.in_features,
             padded_in_features=packed.padded_in_features,
             out_features=packed.out_features,
             input_dtype="uint8",
-            output_dtype=str(out_dtype).removeprefix("torch."),
-            expected_m=rows,
+            output_dtype=str(workload.output_dtype).removeprefix("torch."),
+            expected_m=None,
             alpha_mode="tensor",
         )
-    )
+        return api.plan_regimes(query, exact_m=workload.fixed_token_counts)
+
+    return declare_regimes(layer, "b12x_nvfp4_serialized_regimes", workload, declare)
 
 
 def _serialized_call(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
@@ -75,7 +79,7 @@ def _serialized_call(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
         source = torch.empty(
             (rows, packed.in_features), dtype=out_dtype, device=weight.device
         )
-        quantized = []
+        quantized: list[torch.Tensor] = []
 
         def produce():
             indices = torch.arange(
@@ -113,16 +117,6 @@ def _serialized_call(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
     return call
 
 
-def _serialized_plan_for(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
-    """Return the serialized plan for this row count, declaring it on first use."""
-    plans = layer.b12x_nvfp4_serialized_plans
-    plan = plans.get(rows)
-    if plan is None:
-        plan = _declare_serialized_plan(layer, rows, out_dtype)
-        plans[rows] = plan
-    return plan
-
-
 def _b12x_nvfp4_serialized_linear(
     x_packed: torch.Tensor,
     x_scale_swizzled: torch.Tensor,
@@ -135,11 +129,11 @@ def _b12x_nvfp4_serialized_linear(
     """Serialized NVFP4 GEMM on pre-quantized activations.
 
     ``alpha`` overrides the layer's static alpha when the activation scale is
-    computed per call (online draft heads); the plan is the layer's exact-M
-    serialized declaration either way.
+    computed per call (online draft heads); the plan is the layer's declared
+    serialized regimes either way, which resolve the live row count.
     """
     layer = b12x_layer(_resolve_layer_name(layer_name))
-    plan = _serialized_plan_for(layer, int(x_packed.shape[0]), out_dtype)
+    plan = declared_plan(layer, "b12x_nvfp4_serialized_regimes")
     api = _import_b12x_blockscaled()
     assert api is not None
     output = api.mm_nvfp4(
@@ -329,7 +323,11 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             layer.b12x_nvfp4_packed_weight = existing.packed
         layer.b12x_layer_name = _encode_layer_name(name)
         register_b12x_layer(name, layer)
-        layer.b12x_nvfp4_serialized_plans = {}
+        # A reload keeps the declared serialized regimes: they describe the
+        # layer's geometry, and the weights are passed to every call.
+        layer.b12x_nvfp4_serialized_regimes = getattr(
+            layer, "b12x_nvfp4_serialized_regimes", None
+        )
         if not getattr(layer, "b12x_preparation_suppressed", False):
             set_b12x_preparation_provider(layer, self)
 
@@ -356,29 +354,17 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             return (linear.unit(workload, name=f"linear.nvfp4.{linear.layer_name}"),)
 
         prefix = _resolve_layer_name(layer.b12x_layer_name)
-        plans = layer.b12x_nvfp4_serialized_plans
-        requests = []
-        for rows in workload.token_counts:
-            plan = plans.get(rows)
-            if plan is None:
-                plan = _declare_serialized_plan(layer, rows, workload.output_dtype)
-                plans[rows] = plan
-            call = _serialized_call(layer, rows, workload.output_dtype)
-            requests.append(
-                plan.request(
-                    name=_serialized_name(layer, rows),
-                    prepare_call=call,
-                    benchmark_call=call,
-                )
-            )
-        if not requests:
-            return ()
+        out_dtype = workload.output_dtype
+        plan = _serialized_plan(layer, workload)
         return (
-            B12xPreparationUnit(
-                name="NVFP4",
-                key=(prefix, "serialized", tuple(sorted(plans))),
-                requests=tuple(requests),
-                stage="weights",
+            regime_unit(
+                "NVFP4",
+                prefix,
+                plan,
+                workload,
+                out_dtype,
+                lambda rows: _serialized_call(layer, rows, out_dtype),
+                request_name=f"linear.nvfp4.{prefix}.serialized",
             ),
         )
 
