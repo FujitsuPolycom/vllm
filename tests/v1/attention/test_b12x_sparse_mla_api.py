@@ -1767,6 +1767,7 @@ def test_mla_layer_discovers_backend_and_optional_query_plans(
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
     from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
     from vllm.utils.b12x import (
+        B12xPlanResolver,
         B12xPreparationUnit,
         B12xWorkload,
         set_b12x_preparation_provider,
@@ -1789,7 +1790,7 @@ def test_mla_layer_discovers_backend_and_optional_query_plans(
     set_b12x_preparation_provider(layer, layer)
     if query_projection:
         layer.W_UK_T = torch.empty((2, 16, 32), dtype=torch.bfloat16)
-        layer._b12x_query_plans = {}
+        layer._b12x_query_resolver = B12xPlanResolver("test.query")
         layer._b12x_query_prefix = "test.query"
         layer._b12x_query_call = lambda tokens: None
         layer._declare_b12x_query_plan = lambda tokens: SimpleNamespace(
@@ -1812,7 +1813,10 @@ def test_mla_layer_discovers_backend_and_optional_query_plans(
     assert len(units) == (2 if query_projection else 1)
     if query_projection:
         assert units[1].name == "MLA_QUERY"
-        assert [request.name for request in units[1].requests] == ["test.query.m8"]
+        assert [request.name for request in units[1].requests] == [
+            "test.query.m16",
+            "test.query.m32",
+        ]
 
 
 @pytest.mark.parametrize("b12x_backend", [False, True])
@@ -2381,7 +2385,7 @@ def _deepseek_v4_wo_layer(device, groups=2, heads_per_group=8, rank=128, hidden=
     layer.n_local_heads = groups * heads_per_group
     layer.head_dim, layer.nope_head_dim, layer.rope_head_dim = 512, 448, 64
     layer.hidden_size, layer.o_lora_rank = hidden, rank
-    layer._b12x_wo_plans = {}
+    layer._b12x_wo_resolver = None
     layer._b12x_wo_projection_weights = None
     layer.compress_ratio = 1
     layer.swa_cache_layer = SimpleNamespace(kv_cache=torch.empty(0))
@@ -2450,10 +2454,9 @@ def test_deepseek_v4_wo_declares_exact_rows_and_capacity_before_profiling(
         4,
         8,
         17,
-        17,
     )
     assert all(request.plan.prepared is None for request in unit.requests)
-    for request in unit.requests:
+    for request in unit.requests[:-1]:
         query = request.plan.query
         assert query.operation == "inv_rope"
         assert query.dynamic_tokens is request.name.endswith(".capacity")
@@ -2461,6 +2464,7 @@ def test_deepseek_v4_wo_declares_exact_rows_and_capacity_before_profiling(
         assert query.positions_dtype == "int64" and query.cos_sin_dtype == "bfloat16"
         assert query.sfb_k_replicated
         assert query.wo_a_tiled is tiled and query.wo_b_tiled is tiled
+    assert unit.requests[-1].plan.query.dynamic_tokens
     (repeated,) = layer.get_b12x_preparation_units(layer, workload)
     assert all(a.plan is b.plan for a, b in zip(unit.requests, repeated.requests))
     assert (
@@ -2481,7 +2485,7 @@ def test_deepseek_v4_wo_fake_execution_does_not_materialize_native_plans():
         positions = torch.empty(17, dtype=torch.int64)
         output = layer._o_proj(source, positions)
     assert output.shape == (17, 256) and output.dtype == torch.bfloat16
-    assert layer._b12x_wo_plans == {}
+    assert layer._b12x_wo_resolver is None
 
 
 @pytest.mark.parametrize("groups,heads_per_group", [(1, 1), (2, 8)])
@@ -2547,14 +2551,16 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
             device=device, autotune=False, compile_workers=2
         ) as session:
             session.prepare(units[0].requests)
-            for plan in layer._b12x_wo_plans.values():
+            for plan in (
+                *layer._b12x_wo_resolver.exact_plans.values(),
+                *layer._b12x_wo_resolver.capacity_plans.values(),
+            ):
                 get_b12x_scratch_buffers(plan)
             session.freeze()
             current_workspace_manager().lock()
-            declared = dict(layer._b12x_wo_plans)
+            declared = (dict(layer._b12x_wo_resolver.exact_plans), dict(layer._b12x_wo_resolver.capacity_plans))
             for rows in (*counts, 3, 20, 32):
-                plan = declared.get(rows, declared[None])
-                assert plan is not None
+                plan = layer._b12x_wo_plan(rows)
                 assert plan.prepared is not None
                 scratch = tuple(
                     torch.empty(spec.shape, dtype=spec.dtype, device=device)
@@ -2601,8 +2607,8 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
                     )
                 finally:
                     graph.reset()
-            assert layer._b12x_wo_plans == declared
-            with pytest.raises(ValueError, match="planned token capacity"):
+            assert (layer._b12x_wo_resolver.exact_plans, layer._b12x_wo_resolver.capacity_plans) == declared
+            with pytest.raises(RuntimeError, match="no prepared b12x plan covers"):
                 layer._o_proj(source, positions)
     finally:
         reset_workspace_manager()

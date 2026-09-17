@@ -118,6 +118,53 @@ class _Session:
         self.events.append("cancel")
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_freeze_b12x_preparation_is_gated_by_startup_env(
+    monkeypatch, enabled
+) -> None:
+    from vllm import envs
+    from vllm.v1.worker.gpu_worker import Worker
+
+    calls: list[object] = []
+
+    def freeze():
+        calls.append("freeze")
+
+    session = SimpleNamespace(freeze=freeze)
+    worker = SimpleNamespace(_b12x_session=session)
+    monkeypatch.setattr(envs, "VLLM_B12X_FREEZE_AFTER_STARTUP", enabled)
+    Worker.freeze_b12x_preparation(worker)
+    assert calls == (["freeze"] if enabled else [])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_executor_freezes_workers_only_after_startup(monkeypatch, enabled) -> None:
+    from vllm import envs
+
+    calls: list[object] = []
+
+    def prepare(**kwargs):
+        calls.append(("prepare", kwargs))
+
+    def rpc(method):
+        calls.append(method)
+        return [SimpleNamespace(language_model=1, encoder=2)]
+
+    executor = SimpleNamespace(
+        _run_b12x_preparation=prepare,
+        collective_rpc=rpc,
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace()),
+    )
+    monkeypatch.setattr(envs, "VLLM_B12X_FREEZE_AFTER_STARTUP", enabled)
+    Executor.compile_or_warm_up_model(executor)
+    assert calls[:2] == [
+        ("prepare", {"stage": "state"}),
+        "compile_or_warm_up_model",
+    ]
+    assert ("freeze_b12x_preparation" in calls) is enabled
+
+
+
 def _batches(autotune=True):
     return [((object(),), autotune)]
 

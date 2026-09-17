@@ -365,32 +365,46 @@ def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
     )
     module.n_local_groups, module.n_local_heads = 2, 16
     module.head_dim, module.rope_head_dim = 512, 64
-    module._wo_plans = {}
+    from vllm.utils.b12x import B12xPlanResolver
+
+    module._wo_resolver = B12xPlanResolver("test.v41.wo")
     module._wo_projection_weights = SimpleNamespace(
         groups=2, group_width=4096, rank=1024, hidden=5120
     )
-    module._attention_declarations = {
-        "decode": SimpleNamespace(query=SimpleNamespace(query_rows=8))
-    }
     module.rotary_emb = SimpleNamespace(
         cos_sin_cache=torch.empty(1, 64, dtype=torch.bfloat16)
     )
     workload = B12xWorkload(
         stage="weights",
-        token_counts=(1, 8, 4096),
-        fixed_token_counts=(1, 8),
+        token_counts=(1, 8, 16),
+        fixed_token_counts=(1, 8, 16),
         output_dtype=torch.bfloat16,
         max_tokens=4096,
         max_seqs=8,
         max_model_len=4096,
     )
+    declarations = []
+
+    class Plan:
+        def __init__(self, rows, dynamic_tokens):
+            self.query = SimpleNamespace(
+                max_tokens=rows, dynamic_tokens=dynamic_tokens
+            )
+
+        def request(self, name, **kwargs):
+            return SimpleNamespace(name=name, plan=self, **kwargs)
+
+    def declare(rows, is_prefill):
+        declarations.append((rows, is_prefill))
+        return Plan(rows, is_prefill)
+
+    module._declare_wo_plan = declare
     unit = module._wo_preparation_unit(workload)
-    declarations = dict(module._wo_plans)
     prefill = module._wo_plan(4096, is_prefill=True)
     assert any(request.plan is prefill for request in unit.requests)
     assert prefill.query.max_tokens == 4096 and prefill.query.dynamic_tokens
-    for rows in (1, 127, 128, 129, 3575, 3582, 4096):
+    for rows in (127, 128, 129, 3575, 3582, 4096):
         assert module._wo_plan(rows, is_prefill=True) is prefill
-    assert module._wo_plans == declarations
+    assert declarations == [(1, False), (8, False), (16, False), (4096, True)]
     assert not module._wo_plan(1).query.dynamic_tokens
     assert module._wo_plan(8).query.max_tokens == 8
