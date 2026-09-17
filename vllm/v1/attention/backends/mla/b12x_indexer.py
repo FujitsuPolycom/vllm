@@ -27,6 +27,8 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
     DeepseekV32IndexerMetadataBuilder,
+    get_max_prefill_buffer_size,
+    split_indexer_prefill_chunks,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.worker.block_table import get_block_table_width
@@ -46,6 +48,27 @@ def _prefill_profile_q_rows(max_q_rows: int) -> int:
     )
     supertile_k = max(supertile_k, 256)
     return min(max(int(max_q_rows), 1), max(1, max_logits_elems // supertile_k))
+
+def _prefill_plan_q_rows(vllm_config: VllmConfig) -> int:
+    return _prefill_profile_q_rows(min(vllm_config.scheduler_config.max_num_batched_tokens, get_max_prefill_buffer_size(vllm_config)))
+
+
+def _prefill_plan_q_rows(vllm_config: VllmConfig) -> int:
+    return _prefill_profile_q_rows(min(
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        get_max_prefill_buffer_size(vllm_config),
+    ))
+
+
+def _split_prefill_chunk_rows(
+    chunks: list[tuple[slice, slice]], max_rows: int
+) -> list[tuple[slice, slice]]:
+    """Bound each single-request B12X prefill launch by its plan capacity."""
+    return [
+        (request_slice, slice(start, min(start + max_rows, query_slice.stop)))
+        for request_slice, query_slice in chunks
+        for start in range(query_slice.start, query_slice.stop, max_rows)
+    ]
 
 
 def _is_current_stream_capturing(tensor: torch.Tensor) -> bool:
@@ -84,7 +107,7 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         num_decodes: int,
         max_logits_bytes: int,
     ) -> list[tuple[slice, slice]]:
-        return [
+        chunks = [
             chunk
             for prefill_idx in range(len(prefill_query_lens_cpu))
             for chunk in self._split_indexer_prefill_chunks(
@@ -97,6 +120,9 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
                 request_offset=num_decodes + prefill_idx,
             )
         ]
+        return _split_prefill_chunk_rows(
+            chunks, _prefill_plan_q_rows(self.vllm_config)
+        )
 
     def build(self, *args, **kwargs) -> DeepseekV32IndexerMetadata:
         metadata = super().build(*args, **kwargs)
@@ -344,10 +370,15 @@ class B12xSparseIndexer(nn.Module):
         config = get_current_vllm_config()
         parallel = config.parallel_config
         self._max_num_seqs = int(config.scheduler_config.max_num_seqs)
-        self._max_page_table_width = get_block_table_width(
-            max(1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE),
-            _INDEX_PAGE_SIZE,
+        self._prefill_max_q_rows = _prefill_plan_q_rows(config)
+        spec = config.speculative_config
+        self._decode_query_width = 1 + int(
+            getattr(spec, "num_speculative_tokens", 0) or 0
         )
+        self._max_cudagraph_capture_size = int(
+            config.compilation_config.max_cudagraph_capture_size or 0
+        )
+        self._max_page_table_width = get_block_table_width(max(1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE), _INDEX_PAGE_SIZE)
         self.dcp_world_size = parallel.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel.cp_kv_cache_interleave_size
@@ -366,7 +397,6 @@ class B12xSparseIndexer(nn.Module):
             B12xPcieInvocation,
         )
         from vllm.distributed.parallel_state import register_b12x_collective_describer
-
         def describe(requirements):
             return tuple(
                 B12xPcieInvocation(
@@ -551,8 +581,19 @@ class B12xSparseIndexer(nn.Module):
         requests = []
         prepared_plans: dict[tuple[str, int], object] = {}
         capacities = {
-            "decode": sorted({self._max_num_seqs, *workload.fixed_token_counts}),
-            "prefill": (_prefill_profile_q_rows(workload.max_tokens),),
+            "decode": tuple(
+                sorted(
+                    min(workload.max_tokens, rows)
+                    for rows in {
+                        self._max_num_seqs,
+                        self._max_num_seqs * self._decode_query_width,
+                        self._max_cudagraph_capture_size,
+                        *workload.fixed_token_counts,
+                    }
+                    if rows > 0
+                )
+            ),
+            "prefill": (self._prefill_max_q_rows,),
         }
         for mode, counts in capacities.items():
             for rows in counts:
