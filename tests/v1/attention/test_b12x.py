@@ -1111,24 +1111,20 @@ def test_b12x_attention_preparation_releases_temporary_buffers() -> None:
     assert published.state is state
 
 
-def test_b12x_attention_requires_prepared_decode_plan() -> None:
+def test_b12x_attention_routes_unprepared_decode_to_extend_plan() -> None:
     impl = object.__new__(B12xPagedAttentionImpl)
     impl._noncausal = None
-    impl._plans = {}
+    strides = (4096, 128, 1)
+    extend_plan = object()
+    impl._plans = {("extend", 64, 7, 16, strides, strides): extend_plan}
     impl._verify_q_per_req = 0
     impl._extend_q_capacities = (16,)
     metadata = SimpleNamespace(max_query_len=1)
 
-    with pytest.raises(PreparationResourceUnavailableError, match="not prepared"):
-        impl._select_plan(
-            metadata,
-            7,
-            7,
-            7,
-            64,
-            query_stride=(4096, 128, 1),
-            output_stride=(4096, 128, 1),
-        )
+    assert impl._select_plan(metadata, 7, 7, 7, 64, query_stride=strides, output_stride=strides) == (
+        extend_plan,
+        ("extend", 64, 7, 16, strides, strides),
+    )
 
 
 def test_b12x_attention_fp8_descales_follow_request_batch() -> None:
