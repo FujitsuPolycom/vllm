@@ -1039,7 +1039,10 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                 None,
             )
             if capacity is not None:
-                extend_key = ("extend", page_size, num_reqs, capacity)
+                extend_key = (
+                    "extend", page_size, num_reqs, capacity,
+                    query_stride, output_stride,
+                )
                 extend_plan = self._plans.get(extend_key)
                 if extend_plan is not None:
                     return extend_plan, extend_key
