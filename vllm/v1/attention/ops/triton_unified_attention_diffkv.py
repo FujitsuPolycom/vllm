@@ -28,6 +28,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
@@ -264,7 +265,16 @@ def kernel_unified_attention_diffkv(
                 S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
             )
 
+        previous_M, previous_L = M, L
         M, L, P, alpha = softmax_step(S, M, L)
+        if IS_3D and BLOCK_M == 32 and BLOCK_Q == 2 and SLIDING_WINDOW == 0:
+            # Query reuse can visit the next row's first tile while this row
+            # has no causal keys in it. Preserve the original empty-segment
+            # state instead of introducing a finite maximum into the reducer.
+            has_causal_keys = context_len + query_pos >= j * TILE_SIZE
+            M = tl.where(has_causal_keys, M, previous_M)
+            L = tl.where(has_causal_keys, L, previous_L)
+            alpha = tl.where(has_causal_keys, alpha, 1.0)
         acc = acc * alpha[:, None]
 
         if SLIDING_WINDOW:
@@ -401,6 +411,42 @@ def kernel_reduce_segments_diffkv(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
+def _select_diffkv_tiling(
+    q, k, v, block_table, *, use_3d, max_seqlen_q, sliding_window, num_segments
+):
+    """Select host launch geometry without changing dispatch or split count.
+
+    The multi-query 3D policy depends on the separate split-KV dispatch change.
+    With 16 query heads per KV head, M32 reuses each global KV tile across two
+    query rows. Keep the original T16 KV tile and 16 segments to limit numerical
+    changes, and retain aligned table coverage as the measured scope. Only
+    batches with at least 128 query tokens qualify; 2D geometry stays unchanged.
+    Full serving accuracy and performance require separate validation.
+    """
+    queries_per_kv = q.shape[1] // k.shape[2]
+    block_m = 16 if queries_per_kv <= 16 else triton.next_power_of_2(queries_per_kv)
+    tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
+    if (
+        not is_batch_invariant
+        and use_3d
+        and max_seqlen_q > 1
+        and q.shape[0] >= 128
+        and num_segments == 16
+        and sliding_window == 0
+        and q.dtype == torch.bfloat16
+        and k.dtype == v.dtype
+        and k.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and q.shape[1:] == (16, 192)
+        and k.shape[2:] == (1, 192)
+        and v.shape[2:] == (1, 128)
+        and block_table.shape[1] * v.shape[1] % 64 == 0
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(120, q.device.index or 0)
+    ):
+        block_m = 32
+    return block_m, tile_size
+
+
 def unified_attention_diffkv(
     q,  # [num_tokens, num_query_heads, head_size_qk]
     k,  # view: [num_blocks, block_size, num_kv_heads, head_size_qk]
@@ -451,13 +497,6 @@ def unified_attention_diffkv(
     head_size_qk = q.shape[2]
     head_size_v = v.shape[3]
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
     # Decide between 2D and 3D launch.
@@ -482,9 +521,19 @@ def unified_attention_diffkv(
         or (0 < sliding_window_val <= 128 and num_seqs >= 8)
     )
 
-    # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
-    # smaller tiles to expose more parallelism along the KV dim.
-    tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
+    BLOCK_M, tile_size = _select_diffkv_tiling(
+        q,
+        k,
+        v,
+        block_table,
+        use_3d=use_3d,
+        max_seqlen_q=max_seqlen_q,
+        sliding_window=sliding_window_val,
+        num_segments=num_par_softmax_segments,
+    )
+    # BLOCK_Q and both kernel grids must follow the selected query tile.
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
     grid: tuple[Any, ...]
     if use_3d:
