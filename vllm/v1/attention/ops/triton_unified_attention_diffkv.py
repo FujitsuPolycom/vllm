@@ -410,7 +410,7 @@ def unified_attention_diffkv(
     sinks=None,
     use_alibi_sqrt=False,
     # 3D / split-KV softmax buffers.  When all four are provided and the
-    # batch is decode-only with few sequences, the 3D path is taken.
+    # complete query-token batch fits the workspace, the 3D path is taken.
     seq_threshold_3D: int | None = None,
     num_par_softmax_segments: int | None = None,
     softmax_segm_output: torch.Tensor | None = None,
@@ -452,17 +452,23 @@ def unified_attention_diffkv(
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
-    # Decide between 2D and 3D launch.  Mirrors the standard launcher:
-    # 3D requires preallocated softmax buffers, decode-only batches, and
-    # a small number of sequences (otherwise 2D already saturates the SM).
+    # Decide between 2D and 3D launch.
+    # The builder derives seq_threshold_3D from a 2D grid occupancy heuristic
+    # and uses it as the first dimension of all three split-KV workspaces.
+    # Partials and reduction scalars are indexed by query token, not sequence.
+    # Count tokens to keep short multi-token batches within that allocation;
+    # exceeding either the threshold or any actual buffer capacity keeps 2D.
+    # This does not extend split-KV to every speculative batch size.
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        or q.shape[0] > seq_threshold_3D
+        or q.shape[0] > softmax_segm_output.shape[0]
+        or q.shape[0] > softmax_segm_max.shape[0]
+        or q.shape[0] > softmax_segm_expsum.shape[0]
         or is_batch_invariant
     )
 
