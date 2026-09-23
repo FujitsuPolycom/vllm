@@ -1213,6 +1213,19 @@ class VllmConfig:
         ):
             return
 
+        if self.kv_transfer_config.kv_connector_module_path:
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
+            )
+
+            connector_cls = KVConnectorFactory.get_connector_class(
+                self.kv_transfer_config
+            )
+            # External connectors must retain tensor ownership through copies
+            # and never register KV physical pages with another transport.
+            if getattr(connector_cls, "supports_cuda_vmm", False) is True:
+                return
+
         raise ValueError(
             f"KV connector {self.kv_transfer_config.kv_connector} is "
             "incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "

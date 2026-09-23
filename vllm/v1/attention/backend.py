@@ -444,6 +444,9 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    recurrent_prefill_checkpoint_plans_cpu: (
+        list[tuple[int, int, tuple[int, ...]] | None] | None
+    ) = None
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
     and for all rows outside async spec decode; optimistic for async-spec
@@ -554,6 +557,9 @@ class CommonAttentionMetadata:
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            recurrent_prefill_checkpoint_plans_cpu=maybe_slice_reqs(
+                self.recurrent_prefill_checkpoint_plans_cpu
+            ),
         )
 
 

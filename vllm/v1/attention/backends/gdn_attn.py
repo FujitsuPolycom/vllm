@@ -25,7 +25,15 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    COALESCED_CHECKPOINT_CAPACITY,
+    checkpoint_metadata,
+)
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 
 
 @triton.jit(do_not_specialize=["num_reqs", "source_stride", "accepted_stride"])
@@ -91,6 +99,7 @@ class GDNPrefillCheckpointMetadata:
     block_table_columns: torch.Tensor
     checkpoint_indptr: torch.Tensor | None = None
     checkpoint_query_indices: torch.Tensor | None = None
+    required_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -180,6 +189,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.compilation_config = vllm_config.compilation_config
         self.speculative_config = vllm_config.speculative_config
+        self.hash_block_size = (
+            vllm_config.cache_config.prefix_match_unit or kv_cache_spec.block_size
+        )
+        self.drop_eagle_checkpoint_block = bool(
+            self.speculative_config and self.speculative_config.use_eagle_block_drop()
+        )
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             _resolve_gdn_prefill_backend,
         )
@@ -451,6 +466,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     and self.vllm_config.cache_config.mamba_cache_mode == "align"
                     else None
                 ),
+                checkpoint_hash_block_size=self.hash_block_size,
+                checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
+                drop_eagle_checkpoint_block=self.drop_eagle_checkpoint_block,
             )
         if self._can_reuse_spec_inputs(
             m, num_accepted_tokens, num_decode_draft_tokens_cpu
@@ -692,38 +710,97 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             seq_lens = m.seq_lens_cpu_upper_bound.tolist()
             block_size = self.kv_cache_spec.block_size
-            checkpoint_offsets: list[int] = []
-            checkpoint_columns: list[int] = []
-            packed = self.kv_cache_spec.num_prefill_checkpoint_blocks > 1
+            plans = getattr(m, "recurrent_prefill_checkpoint_plans_cpu", None)
+            if plans is not None and len(plans) < len(all_query_lens):
+                raise ValueError("checkpoint plan rows do not cover the packed batch")
+            planned = plans is not None and any(
+                plans[row] is not None for row in request_rows
+            )
+            checkpoint_offsets: list = []
+            checkpoint_columns: list = []
+            checkpoint_required: list[list[bool]] = []
+            packed = (
+                self.kv_cache_spec.num_prefill_checkpoint_blocks > 1 and not planned
+            )
             checkpoint_indptr = [0]
             checkpoint_query_indices: list[int] = []
             checkpoint_request_rows: list[int] = []
             for query_index, row in enumerate(request_rows):
                 query_len = all_query_lens[row]
                 seq_len = seq_lens[row]
+                if planned:
+                    plan = plans[row]
+                    offsets, columns = checkpoint_metadata(
+                        plan,
+                        seq_len - query_len,
+                        seq_len,
+                        block_size,
+                        min(
+                            self.kv_cache_spec.num_prefill_checkpoint_blocks,
+                            COALESCED_CHECKPOINT_CAPACITY,
+                        ),
+                    )
+                    checkpoint_offsets.append(offsets)
+                    checkpoint_columns.append(columns)
+                    checkpoint_required.append(
+                        [plan is not None and column >= 0 for column in columns]
+                    )
+                    continue
                 if packed:
                     columns = self.kv_cache_spec.prefill_checkpoint_indices(
                         seq_len - query_len, seq_len
                     )
-                    checkpoint_columns.extend(columns)
-                    checkpoint_offsets.extend(
-                        (column + 1) * block_size - (seq_len - query_len)
-                        for column in columns
-                    )
-                    checkpoint_query_indices.extend([query_index] * len(columns))
-                    checkpoint_request_rows.extend([row] * len(columns))
+                    if columns:
+                        checkpoint_columns.extend(columns)
+                        checkpoint_offsets.extend(
+                            (column + 1) * block_size - (seq_len - query_len)
+                            for column in columns
+                        )
+                        checkpoint_query_indices.extend([query_index] * len(columns))
+                        checkpoint_request_rows.extend([row] * len(columns))
+                    else:
+                        # An unplanned query can cross more boundaries than
+                        # the bounded packed-checkpoint reserve. Match the
+                        # sparse allocator's hash-unit boundary and block column.
+                        position = get_mamba_prefill_checkpoint_position(
+                            seq_len,
+                            self.hash_block_size,
+                            self.drop_eagle_checkpoint_block,
+                        )
+                        valid = is_mamba_prefill_checkpoint_valid(
+                            seq_len - query_len,
+                            seq_len,
+                            position,
+                            self.hash_block_size,
+                            block_size,
+                            self.kv_cache_spec.prefill_checkpoint_alignment,
+                        )
+                        if valid:
+                            checkpoint_offsets.append(position - (seq_len - query_len))
+                            checkpoint_columns.append(
+                                (seq_len + block_size - 1) // block_size - 2
+                            )
+                            checkpoint_query_indices.append(query_index)
+                            checkpoint_request_rows.append(row)
                     checkpoint_indptr.append(len(checkpoint_offsets))
                     continue
-                offset = seq_len // block_size * block_size - (seq_len - query_len)
-                valid = (
-                    seq_len % block_size != 0
-                    and 0 < offset < query_len
-                    # FlashKDA checkpoint outputs are produced on its
-                    # 16-token recurrence boundary.
-                    and offset % 16 == 0
+                position = get_mamba_prefill_checkpoint_position(
+                    seq_len, self.hash_block_size, self.drop_eagle_checkpoint_block
                 )
-                checkpoint_offsets.append(offset if valid else 0)
-                checkpoint_columns.append(seq_len // block_size - 1 if valid else -1)
+                valid = is_mamba_prefill_checkpoint_valid(
+                    seq_len - query_len,
+                    seq_len,
+                    position,
+                    self.hash_block_size,
+                    block_size,
+                    self.kv_cache_spec.prefill_checkpoint_alignment,
+                )
+                checkpoint_offsets.append(
+                    position - (seq_len - query_len) if valid else 0
+                )
+                checkpoint_columns.append(
+                    (seq_len + block_size - 1) // block_size - 2 if valid else -1
+                )
 
             if any(checkpoint_offsets):
                 checkpoint_offsets_tensor = async_tensor_h2d(
@@ -742,7 +819,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
                 checkpoint_state_indices = m.block_table_tensor[
-                    request_rows_tensor, checkpoint_columns_tensor
+                    request_rows_tensor[:, None] if planned else request_rows_tensor,
+                    checkpoint_columns_tensor,
                 ]
                 checkpoint_state_indices = torch.where(
                     checkpoint_columns_tensor >= 0,
@@ -772,7 +850,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         if packed
                         else None
                     ),
+                    required_mask=(
+                        async_tensor_h2d(
+                            checkpoint_required,
+                            dtype=torch.bool,
+                            device=query_start_loc.device,
+                        )
+                        if planned
+                        else None
+                    ),
                 )
+                if prefill_checkpoint.required_mask is not None:
+                    torch._assert_async(
+                        torch.all(
+                            ~prefill_checkpoint.required_mask
+                            | (checkpoint_state_indices != NULL_BLOCK_ID)
+                        ),
+                        "planned recurrent checkpoint refers to a NULL state block",
+                    )
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
@@ -973,7 +1068,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_checkpoint = metadata.prefill_checkpoint
         if prefill_checkpoint is not None:
             checkpoint_state_indices = blk_table[
-                prefill_checkpoint.request_rows,
+                prefill_checkpoint.request_rows[:, None]
+                if prefill_checkpoint.block_table_columns.ndim == 2
+                else prefill_checkpoint.request_rows,
                 prefill_checkpoint.block_table_columns,
             ]
             checkpoint_state_indices = torch.where(
@@ -981,6 +1078,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 checkpoint_state_indices,
                 NULL_BLOCK_ID,
             )
+            if prefill_checkpoint.required_mask is not None:
+                torch._assert_async(
+                    torch.all(
+                        ~prefill_checkpoint.required_mask
+                        | (checkpoint_state_indices != NULL_BLOCK_ID)
+                    ),
+                    "planned recurrent checkpoint refers to a NULL state block",
+                )
             prefill_checkpoint = replace(
                 prefill_checkpoint,
                 state_indices=checkpoint_state_indices,

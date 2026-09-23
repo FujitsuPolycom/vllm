@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -219,15 +219,22 @@ class KVConnectorBlockState:
 
     # Requests scheduled this step and requests with a boundary-state hand-off.
     req_ids: set[str]
-    # Resolve on access to avoid copying tables the connector never reads.
+    # Resolve only while constructing this scheduled step's snapshot.
     resolve_block_ids: Callable[[str], tuple[list[int], ...]]
     # Exact Mamba "align" boundary-state hand-offs.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]]
+    block_ids: dict[str, tuple[list[int], ...]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Optional publication may outlive dispatch; it must not read a later
+        # allocator table. Copy each group as well as the request mapping.
+        self.block_ids = {
+            req_id: tuple(list(group) for group in self.resolve_block_ids(req_id))
+            for req_id in self.req_ids
+        }
 
     def get_block_ids(self, req_id: str) -> tuple[list[int], ...] | None:
-        if req_id not in self.req_ids:
-            return None
-        return self.resolve_block_ids(req_id)
+        return self.block_ids.get(req_id)
 
 
 @dataclass
@@ -270,6 +277,9 @@ class SchedulerOutput:
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
     # This batch samples saved final hidden states without a target forward.
     boundary_logits_only: bool = False
+    recurrent_prefill_checkpoint_plans: (
+        dict[str, tuple[int, int, tuple[int, ...]]] | None
+    ) = None
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

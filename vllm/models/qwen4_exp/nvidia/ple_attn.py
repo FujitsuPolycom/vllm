@@ -13,6 +13,10 @@ from vllm.v1.attention.backends.short_conv_attn import (
     ShortConvAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import (
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 
 # vLLM reserves block zero; b12x PLE uses -1 for disabled requests.
 _B12X_NULL_STATE_SLOT = -1
@@ -85,6 +89,9 @@ class PLEGraphInputs:
 @dataclass
 class PLEAttentionMetadata(ShortConvAttentionMetadata):
     graph_inputs: PLEGraphInputs | None = None
+    checkpoint_columns: torch.Tensor | None = None
+    checkpoint_offsets: torch.Tensor | None = None
+    checkpoint_slots: torch.Tensor | None = None
 
 
 class PLEAttentionBackend(ShortConvAttentionBackend):
@@ -107,6 +114,22 @@ class PLEAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         self.graph_inputs = PLEGraphInputs(
             scheduler.max_num_seqs, scheduler.max_num_batched_tokens, device
         )
+        self.checkpoint_offsets = torch.zeros(
+            scheduler.max_num_seqs, dtype=torch.int32, device=device
+        )
+        self.checkpoint_slots = torch.full(
+            (scheduler.max_num_seqs,),
+            _B12X_NULL_STATE_SLOT,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.hash_block_size = (
+            vllm_config.cache_config.prefix_match_unit or kv_cache_spec.block_size
+        )
+        speculation = vllm_config.speculative_config
+        self.drop_eagle_checkpoint_block = bool(
+            speculation and speculation.use_eagle_block_drop()
+        )
 
     def build(
         self, common_prefix_len, common_attn_metadata, fast_build=False, **kwargs
@@ -116,7 +139,59 @@ class PLEAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         )
         assert isinstance(metadata, PLEAttentionMetadata)
         self.graph_inputs.stage(metadata, common_attn_metadata.query_start_loc)
-        return replace(metadata, graph_inputs=self.graph_inputs)
+        self.checkpoint_offsets.zero_()
+        self.checkpoint_slots.fill_(_B12X_NULL_STATE_SLOT)
+        columns = None
+        if metadata.num_prefills and self.kv_cache_spec.num_prefill_checkpoint_blocks:
+            common = common_attn_metadata
+            assert common.seq_lens_cpu_upper_bound is not None
+            starts = common.query_start_loc_cpu.tolist()
+            lengths = common.seq_lens_cpu_upper_bound.tolist()
+            offsets, host_columns = [0] * metadata.num_reqs, [0] * metadata.num_reqs
+            size = self.kv_cache_spec.block_size
+            for row in range(metadata.num_decodes, metadata.num_reqs):
+                length = lengths[row]
+                start = length - (starts[row + 1] - starts[row])
+                # Every recurrent group follows the allocator's speculation boundary.
+                position = get_mamba_prefill_checkpoint_position(
+                    length, self.hash_block_size, self.drop_eagle_checkpoint_block
+                )
+                if is_mamba_prefill_checkpoint_valid(
+                    start,
+                    length,
+                    position,
+                    self.hash_block_size,
+                    size,
+                    self.kv_cache_spec.prefill_checkpoint_alignment,
+                ):
+                    offsets[row] = position - start
+                    host_columns[row] = (length + size - 1) // size - 2
+            device = self.graph_inputs.num_tokens.device
+            self.checkpoint_offsets[: metadata.num_reqs].copy_(
+                torch.tensor(offsets, dtype=torch.int32, device=device)
+            )
+            columns = torch.tensor(host_columns, dtype=torch.int64, device=device)
+            self._refresh_checkpoints(
+                metadata.num_reqs, columns, common.block_table_tensor
+            )
+        return replace(
+            metadata,
+            graph_inputs=self.graph_inputs,
+            checkpoint_columns=columns,
+            checkpoint_offsets=self.checkpoint_offsets if columns is not None else None,
+            checkpoint_slots=self.checkpoint_slots if columns is not None else None,
+        )
+
+    def _refresh_checkpoints(self, rows, columns, block_table):
+        request_rows = torch.arange(rows, device=block_table.device)
+        selected = block_table[request_rows, columns]
+        self.checkpoint_slots[:rows].copy_(
+            torch.where(
+                (self.checkpoint_offsets[:rows] > 0) & (selected != NULL_BLOCK_ID),
+                selected,
+                _B12X_NULL_STATE_SLOT,
+            )
+        )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -131,4 +206,21 @@ class PLEAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         updated = super().update_block_table(metadata, blk_table, slot_mapping)
         assert isinstance(updated, PLEAttentionMetadata)
         self.graph_inputs.stage(updated, metadata.graph_inputs.query_start_loc)
-        return replace(updated, graph_inputs=self.graph_inputs)
+        if metadata.checkpoint_columns is not None:
+            assert metadata.checkpoint_offsets is not None
+            self.checkpoint_offsets.copy_(metadata.checkpoint_offsets)
+            self.checkpoint_slots.fill_(_B12X_NULL_STATE_SLOT)
+            self._refresh_checkpoints(
+                updated.num_reqs, metadata.checkpoint_columns, blk_table
+            )
+        return replace(
+            updated,
+            graph_inputs=self.graph_inputs,
+            checkpoint_columns=metadata.checkpoint_columns,
+            checkpoint_offsets=self.checkpoint_offsets
+            if metadata.checkpoint_columns is not None
+            else None,
+            checkpoint_slots=self.checkpoint_slots
+            if metadata.checkpoint_columns is not None
+            else None,
+        )

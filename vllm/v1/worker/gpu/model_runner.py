@@ -2056,6 +2056,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
+            checkpoint_kwargs = {}
+            checkpoint_plans = (
+                None
+                if dummy_run
+                else scheduler_output.recurrent_prefill_checkpoint_plans
+            )
+            if checkpoint_plans:
+                if batch_desc.cg_mode != CUDAGraphMode.NONE:
+                    raise ValueError(
+                        "coalesced recurrent checkpoints require eager prefill"
+                    )
+                checkpoint_kwargs["recurrent_prefill_checkpoint_plans"] = (
+                    checkpoint_plans
+                )
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -2067,6 +2081,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # from the zeroed dummy block tables instead of retaining state
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                **checkpoint_kwargs,
             )
 
         input_ids = input_batch.input_ids
@@ -2180,6 +2195,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                is_dummy_run=dummy_run,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:

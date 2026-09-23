@@ -136,6 +136,10 @@ async def build_and_serve(
     app = build_app(args, supported_tasks, model_config)
     await init_app_state(engine_client, app.state, args, supported_tasks)
 
+    from .sparkring_startup_audit import emit
+
+    emit(engine_client.vllm_config, logger)
+
     logger.info("Starting vLLM server on %s", listen_address)
 
     return await serve_http(

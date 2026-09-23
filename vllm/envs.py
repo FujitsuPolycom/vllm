@@ -192,6 +192,10 @@ if TYPE_CHECKING:
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
+    VLLM_B12X_KDA_PREFILL_COALESCING: bool = False
+    VLLM_B12X_KDA_PREFILL_COALESCING_LOG_LIMIT: int = 0
+    VLLM_GLM53_MHC_PREFILL_SHARD: bool = False
+    VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS: bool = False
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
@@ -203,6 +207,8 @@ if TYPE_CHECKING:
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+    VLLM_QWEN3_8_HC_PREFILL_MODE: str = "off"
+    VLLM_QWEN3_8_PREFILL_COALESCE: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1652,6 +1658,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Deployment default; explicit kernel configuration or CLI selection wins.
     "VLLM_DEFAULT_MOE_BACKEND": lambda: os.getenv("VLLM_DEFAULT_MOE_BACKEND", "auto"),
     # Force b12x FP4 MoE to use BF16 activations.
+    "VLLM_B12X_KDA_PREFILL_COALESCING": lambda: bool(
+        int(os.getenv("VLLM_B12X_KDA_PREFILL_COALESCING", "0"))
+    ),
+    "VLLM_B12X_KDA_PREFILL_COALESCING_LOG_LIMIT": lambda: max(
+        0, int(os.getenv("VLLM_B12X_KDA_PREFILL_COALESCING_LOG_LIMIT", "0"))
+    ),
+    "VLLM_GLM53_MHC_PREFILL_SHARD": lambda: bool(
+        int(os.getenv("VLLM_GLM53_MHC_PREFILL_SHARD", "0"))
+    ),
+    "VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS": lambda: bool(
+        int(os.getenv("VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS", "0"))
+    ),
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
@@ -1692,6 +1710,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+    ),
+    "VLLM_QWEN3_8_HC_PREFILL_MODE": lambda: os.getenv(
+        "VLLM_QWEN3_8_HC_PREFILL_MODE", "off"
+    ),
+    "VLLM_QWEN3_8_PREFILL_COALESCE": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_PREFILL_COALESCE", "0"))
     ),
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the

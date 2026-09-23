@@ -139,6 +139,8 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> torch.Tensor:
         output = torch.empty_like(hidden_states)
         if _GATE_SIDE_STREAM and not self.use_full_rank_gate:
@@ -148,11 +150,20 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 hidden_states.size(0)
             )
             if _gate_overlap_allowed():
-                self._forward_gate_overlap(
-                    hidden_states, output, gate_workspace, main_workspace
-                )
+                if defer_tp_reduction:
+                    self._forward_gate_overlap(
+                        hidden_states, output, gate_workspace, main_workspace,
+                        defer_tp_reduction=True,
+                    )
+                else:
+                    self._forward_gate_overlap(
+                        hidden_states, output, gate_workspace, main_workspace
+                    )
                 return output
-        super().forward(hidden_states, positions, output)
+        if defer_tp_reduction:
+            super().forward(hidden_states, positions, output, defer_tp_reduction=True)
+        else:
+            super().forward(hidden_states, positions, output)
         return output
 
     def _projection_workspaces(
@@ -179,6 +190,8 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         output: torch.Tensor,
         gate_workspace: torch.Tensor | None,
         main_workspace: torch.Tensor | None,
+        *,
+        defer_tp_reduction: bool = False,
     ) -> None:
         num_tokens = hidden_states.size(0)
         main = torch.cuda.current_stream(hidden_states.device)
@@ -235,7 +248,10 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        output[:] = self.o_proj(core_attn_out)[0]
+        if defer_tp_reduction:
+            output[:] = self.o_proj(core_attn_out, defer_tp_reduction=True)[0]
+        else:
+            output[:] = self.o_proj(core_attn_out)[0]
 
 
 __all__ = ["Glm5NextLinearAttention"]

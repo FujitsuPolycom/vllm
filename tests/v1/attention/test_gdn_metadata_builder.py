@@ -603,6 +603,76 @@ def test_gdn_packed_checkpoints_cover_internal_boundaries_and_empty_ranges() -> 
     )
 
 
+def test_gdn_unplanned_query_over_capacity_uses_final_sparse_boundary() -> None:
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=4)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    batch = BatchSpec(seq_lens=[96, 95], query_lens=[96, 95])
+    common = create_common_attn_metadata(
+        batch,
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(is_prefilling=torch.tensor([True, True]))
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    checkpoint = metadata.prefill_checkpoint
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_offsets.tolist() == [80]
+    assert checkpoint.checkpoint_indptr.tolist() == [0, 0, 1]
+    assert checkpoint.checkpoint_query_indices.tolist() == [1]
+    assert checkpoint.request_rows.tolist() == [1]
+    assert checkpoint.block_table_columns.tolist() == [4]
+
+
+def test_gdn_sparse_four_checkpoint_plan_preserves_r33_packed_metadata() -> None:
+    """Explicit B12X plans use a matrix without changing packed FlashKDA rows."""
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=4)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[160], query_lens=[96]),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(
+        is_prefilling=torch.tensor([True]),
+        recurrent_prefill_checkpoint_plans_cpu=[(64, 160, (80, 96, 112, 144))],
+    )
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    checkpoint = metadata.prefill_checkpoint
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_offsets.tolist() == [[16, 32, 48, 80]]
+    assert checkpoint.block_table_columns.tolist() == [[4, 5, 6, 8]]
+    assert checkpoint.checkpoint_indptr is None
+    assert checkpoint.checkpoint_query_indices is None
+    assert checkpoint.required_mask is not None and checkpoint.required_mask.all()
+
+    replacement = common.block_table_tensor + 100
+    updated = builder.update_block_table(
+        metadata, replacement, torch.zeros(96, dtype=torch.int64)
+    )
+    assert updated.prefill_checkpoint is not None
+    torch.testing.assert_close(
+        updated.prefill_checkpoint.state_indices,
+        replacement[checkpoint.request_rows[:, None], checkpoint.block_table_columns],
+    )
+
+
+def test_gdn_sparse_plan_rejects_missing_required_state_storage() -> None:
+    builder = _create_gdn_builder(num_prefill_checkpoint_blocks=4)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[160], query_lens=[96]),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(
+        is_prefilling=torch.tensor([True]),
+        recurrent_prefill_checkpoint_plans_cpu=[(64, 160, (80, 96, 112, 144))],
+    )
+    common.block_table_tensor[0, 6] = 0
+    with pytest.raises(RuntimeError, match="NULL state block"):
+        builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+
 def test_gdn_update_block_table_uses_current_builders_graph_buffers() -> None:
     builder_a = _create_gdn_builder(full_cuda_graph=True)
     builder_b = _create_gdn_builder(full_cuda_graph=True)

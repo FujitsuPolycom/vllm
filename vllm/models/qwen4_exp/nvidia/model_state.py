@@ -12,6 +12,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
+from vllm.v1.core.recurrent_prefill_checkpoint import checkpoint_plan_rows
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
@@ -295,6 +296,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
         ubatch_idx: int = 0,
+        recurrent_prefill_checkpoint_plans: dict | None = None,
     ) -> dict[str, Any]:
         assert ubatch_idx == 0, "DBO is not supported"
         if not self.uses_qsa:
@@ -307,6 +309,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 kv_cache_config,
                 for_capture=for_capture,
                 ubatch_idx=ubatch_idx,
+                recurrent_prefill_checkpoint_plans=recurrent_prefill_checkpoint_plans,
             )
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
@@ -366,7 +369,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 block_tables,
             )
 
+        checkpoint_rows = checkpoint_plan_rows(
+            input_batch,
+            recurrent_prefill_checkpoint_plans,
+            num_reqs,
+            for_capture=for_capture,
+        )
         model_metadata = Qwen4ExpAttnMetadata(
+            recurrent_prefill_checkpoint_plans_cpu=checkpoint_rows,
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,

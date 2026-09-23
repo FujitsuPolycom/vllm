@@ -8,6 +8,8 @@ from dataclasses import replace
 import torch
 from torch import nn
 
+from vllm import envs
+
 from vllm.compilation.breakable_cudagraph import (
     eager_break_during_capture,
 )
@@ -42,6 +44,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from .b12x_ple import (
     B12xNGramEmbedding,
@@ -786,6 +789,22 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self._state_plans = {}
         super().unbind_kv_cache()
 
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        if not envs.VLLM_QWEN3_8_PREFILL_COALESCE:
+            return spec
+        if not self._use_b12x:
+            raise ValueError("PLE checkpoint coalescing requires the B12X backend")
+        if (
+            vllm_config.use_request_boundary_checkpoints
+            or vllm_config.cache_config.mamba_cache_mode != "align"
+        ):
+            raise ValueError("Qwen PLE internal checkpoints require aligned caching")
+        return replace(
+            spec, num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=16
+        )
+
     def _prepare_metadata(
         self,
         metadata: PLEAttentionMetadata,
@@ -839,9 +858,17 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self._key[:token_count].copy_(key)
         self._value[:token_count].copy_(value)
         self._prepare_metadata(metadata, query_start_loc, token_count)
-        _b12x_module("ple").run_mixed(
-            self._bind_ple(token_count), eps=self.eps, token_count=token_count
-        )
+        binding = self._bind_ple(token_count)
+        api = _b12x_module("ple")
+        api.run_mixed(binding, eps=self.eps, token_count=token_count)
+        if metadata.checkpoint_columns is not None:
+            assert metadata.checkpoint_offsets is not None
+            assert metadata.checkpoint_slots is not None
+            api.export_checkpoint(
+                binding,
+                offsets=metadata.checkpoint_offsets,
+                slots=metadata.checkpoint_slots,
+            )
 
 
 __all__ = [

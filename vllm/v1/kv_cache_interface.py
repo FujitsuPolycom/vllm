@@ -1095,8 +1095,10 @@ class MambaSpec(KVCacheSpec):
         output path. Columns are shared by allocator and attention metadata so
         no uninitialized page can be advertised as a reusable checkpoint.
 
-        Raises:
-            ValueError: If the query exceeds the declared checkpoint capacity.
+        Queries with more internal boundaries than the declared capacity use
+        the ordinary sparse final-boundary path instead. This keeps an
+        unplanned long prefill executable without advertising checkpoint pages
+        that the allocator cannot retain.
         """
         if (
             self.num_prefill_checkpoint_blocks <= 1
@@ -1110,7 +1112,7 @@ class MambaSpec(KVCacheSpec):
         stop = (num_tokens - 1) // self.block_size
         columns = tuple(range(first, stop))
         if len(columns) > self.num_prefill_checkpoint_blocks:
-            raise ValueError("Prefill checkpoint count exceeds its declared capacity")
+            return ()
         return columns
 
     @property

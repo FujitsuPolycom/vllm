@@ -240,6 +240,11 @@ class Qwen4ExpQSAMetadataBuilder(B12xPagedMetadataBuilder):
         is_prefilling = self._capture_is_prefilling[:num_reqs]
         request_ids = cm.token_to_req_indices(self._request_ids)
         num_mapped_tokens = int(cm.query_start_loc_cpu[-1])
+        # Captured views can exceed the next batch's live metadata slice.
+        # Clear the owned inactive capacity without overwriting a cached
+        # live mapping shared by attention metadata builders.
+        inactive_capacity_start = max(num_mapped_tokens, cm.num_actual_tokens)
+        self._request_ids[inactive_capacity_start:].fill_(-1)
         if num_mapped_tokens < cm.num_actual_tokens:
             request_ids[num_mapped_tokens:].fill_(-1)
         return Qwen4ExpQSAMetadata(

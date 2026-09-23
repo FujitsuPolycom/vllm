@@ -19,6 +19,11 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    CheckpointPlan,
+    continuation_layout,
+    validate_plan,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -1910,6 +1915,7 @@ class MambaManager(SingleTypeKVCacheManager):
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        self._planned_recurrent_checkpoints: dict[str, CheckpointPlan] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -2152,6 +2158,8 @@ class MambaManager(SingleTypeKVCacheManager):
             and (
                 checkpoint_idx >= len(blocks)
                 or blocks[checkpoint_idx].is_null
+                # An occupied speculative column is not a retained checkpoint.
+                # Consuming it requires a replacement scratch block at the tail.
                 or (
                     request_id in self._allocated_block_reqs
                     and checkpoint_idx >= len(blocks) - self.num_speculative_blocks
@@ -2170,6 +2178,41 @@ class MambaManager(SingleTypeKVCacheManager):
         apply_admission_cap: bool = False,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        plan = self._planned_recurrent_checkpoints.get(request_id)
+        if plan is not None:
+            start, end, targets = plan
+            validate_plan(plan, start, end, self.block_size)
+            if apply_admission_cap:
+                resident = (
+                    2
+                    + self.num_speculative_blocks
+                    + self.kv_cache_spec.num_prefill_checkpoint_blocks
+                )
+                owned = sum(
+                    not block.is_null for block in self.req_to_blocks[request_id]
+                )
+                return max(resident - owned, 0)
+            if (
+                new_computed_blocks
+                or total_computed_tokens != start
+                or num_tokens_main_model != end
+            ):
+                raise ValueError(
+                    "checkpoint admission differs from the planned query span"
+                )
+            if start:
+                _, layout = continuation_layout(
+                    self.req_to_blocks[request_id],
+                    plan,
+                    self.block_size,
+                    self.num_speculative_blocks,
+                )
+                return layout.count(-2)
+            if self.req_to_blocks.get(request_id):
+                raise ValueError(
+                    "cold checkpoint allocation requires an empty block table"
+                )
+            return len(targets) + 1 + self.num_speculative_blocks
         if (
             len(new_computed_blocks) > 0
             and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
@@ -2272,11 +2315,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 else:
                     self._checkpoints.pop(request_id, None)
             if num_new_blocks > 0:
-                blocks_allocated = request_id in self._allocated_block_reqs
-                if not (checkpoint_block and blocks_allocated):
-                    num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
-                    if not blocks_allocated:
-                        num_new_blocks += self.num_speculative_blocks
+                # Reuse private speculative scratch except the slot becoming
+                # a checkpoint; reserve that slot's replacement, not logical gaps.
+                num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                if request_id not in self._allocated_block_reqs:
+                    num_new_blocks += self.num_speculative_blocks
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
@@ -2287,6 +2330,47 @@ class MambaManager(SingleTypeKVCacheManager):
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        plan = self._planned_recurrent_checkpoints.get(request_id)
+        if plan is not None:
+            start, end, targets = plan
+            if num_tokens_main_model != end:
+                raise ValueError("checkpoint allocation differs from the planned end")
+            blocks = self.req_to_blocks[request_id]
+            if start:
+                source, layout = continuation_layout(
+                    blocks, plan, self.block_size, self.num_speculative_blocks
+                )
+                retained = tuple(blocks)
+                allocated = iter(self.block_pool.get_new_blocks(layout.count(-2)))
+                replacement = [
+                    retained[index]
+                    if index >= 0
+                    else self._null_block
+                    if index == -1
+                    else next(allocated)
+                    for index in layout
+                ]
+                self.last_state_block_idx[request_id] = source
+                blocks[:] = replacement
+                self._allocated_block_reqs.add(request_id)
+                return replacement[len(retained) :]
+            if blocks:
+                raise ValueError(
+                    "cold checkpoint allocation requires an empty block table"
+                )
+            final_column = cdiv(end, self.block_size) - 1
+            columns = [target // self.block_size - 1 for target in targets]
+            columns.extend(
+                range(final_column, final_column + 1 + self.num_speculative_blocks)
+            )
+            physical = self.block_pool.get_new_blocks(len(columns))
+            blocks.extend(
+                [self._null_block] * (final_column + 1 + self.num_speculative_blocks)
+            )
+            for column, block in zip(columns, physical):
+                blocks[column] = block
+            self._allocated_block_reqs.add(request_id)
+            return blocks[:]
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
@@ -2356,12 +2440,19 @@ class MambaManager(SingleTypeKVCacheManager):
                         [self._null_block for _ in range(prev_block_len, null_end)]
                     )
 
-                if blocks_allocated and not checkpoint_block:
+                if blocks_allocated:
                     # Relocate exclusively owned speculative scratch blocks.
                     for block_idx in range(
                         prev_block_len - self.num_speculative_blocks, prev_block_len
                     ):
                         if block_idx < num_skipped_blocks:
+                            if checkpoint_block and block_idx == num_skipped_blocks - 1:
+                                # Keep the worker-visible column as the checkpoint;
+                                # the reservation replaces its scratch slot below.
+                                assert self.block_pool.is_block_writable(
+                                    req_blocks[block_idx]
+                                ), "A speculative checkpoint must be exclusively owned"
+                                continue
                             self._relocate_speculative_block(req_blocks, block_idx)
                         else:
                             break
@@ -2369,7 +2460,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
-                if not blocks_allocated or checkpoint_block:
+                if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
@@ -2452,6 +2543,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
             self._packed_prefill_checkpoint_reqs.discard(request_id)
+            self._planned_recurrent_checkpoints.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to

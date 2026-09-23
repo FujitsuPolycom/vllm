@@ -15,6 +15,42 @@ HIDDEN, HEADS, HEAD_DIM, GATE_RANK = 64, 2, 16, 8
 PROJ = HEADS * HEAD_DIM
 
 
+@pytest.mark.parametrize("overlap,allowed", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("defer", [False, True])
+def test_projection_reduction_deferral_preserves_workspace_reservation(
+    monkeypatch, overlap, allowed, defer
+):
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.use_full_rank_gate = False
+    observed, reservations = [], []
+    gate, main = object(), object()
+
+    def reserve(rows):
+        reservations.append(rows)
+        return gate, main
+
+    def shared_forward(self, hidden, positions, output, **kwargs):
+        observed.append(("shared", kwargs.get("defer_tp_reduction", False)))
+        output.copy_(hidden)
+
+    def side_forward(hidden, output, gate_workspace, main_workspace, **kwargs):
+        assert gate_workspace is gate and main_workspace is main
+        observed.append(("side", kwargs.get("defer_tp_reduction", False)))
+        output.copy_(hidden)
+
+    monkeypatch.setattr(kda_module.KimiGatedDeltaNetAttention, "forward", shared_forward)
+    monkeypatch.setattr(kda_module, "_GATE_SIDE_STREAM", overlap)
+    monkeypatch.setattr(kda_module, "_gate_overlap_allowed", lambda: allowed)
+    layer._projection_workspaces = reserve
+    layer._forward_gate_overlap = side_forward
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    output = layer(hidden, positions=None, defer_tp_reduction=defer)
+    assert torch.equal(output, hidden)
+    assert reservations == ([2] if overlap else [])
+    assert observed == [("side" if overlap and allowed else "shared", defer)]
+
+
 class _Linear:
     """Stands in for a vLLM linear layer: returns (y, None) and records the
     CUDA stream it ran on."""

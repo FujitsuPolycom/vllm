@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 from vllm.logger import init_logger
@@ -72,6 +72,7 @@ class KVCacheCoordinator(ABC):
     """
 
     enable_partial_hash_hits = False
+    recurrent_publication_boundary_provider: Callable[[Request], object] | None = None
 
     def __init__(
         self,
@@ -331,6 +332,33 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def get_recurrent_publication_boundaries(self, request: Request) -> tuple[int, ...]:
+        """Validate optional, metadata-only connector hints before materialization.
+
+        Hints never prove that bytes exist. Normal finalized-token bounds, block
+        hashes and connector read leases still govern publication. Nothing is
+        latched: withdrawn hints disappear, and already-computed positions cannot
+        resurrect states skipped by an earlier cache pass.
+        """
+        provider = getattr(self, "recurrent_publication_boundary_provider", None)
+        if not callable(provider) or request.use_boundary_checkpoints:
+            return ()
+        try:
+            proposed = provider(request)
+        except Exception:
+            return ()
+        if type(proposed) not in (tuple, list) or len(proposed) > 4:
+            return ()
+        if any(
+            type(position) is not int
+            or not request.num_computed_tokens < position < request.num_prompt_tokens
+            or position <= 0
+            or position % self.scheduler_block_size
+            for position in proposed
+        ):
+            return ()
+        return tuple(sorted(set(proposed)))
+
     def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
         """Positions a later request replaying this prompt can resume at.
 
@@ -349,7 +377,7 @@ class KVCacheCoordinator(ABC):
             boundary = max(
                 request.num_prompt_tokens - max(1, self.prefill_replay_tokens), 0
             )
-            return tuple(
+            native = tuple(
                 dict.fromkeys(
                     position
                     for alignment in (
@@ -361,14 +389,22 @@ class KVCacheCoordinator(ABC):
                     )
                 )
             )
-        if not self.eagle_group_ids:
-            return (
+        elif not self.eagle_group_ids:
+            native = (
                 max(request.num_prompt_tokens - max(1, self.prefill_replay_tokens), 0),
             )
-        block = self.scheduler_block_size
-        resend = (request.num_prompt_tokens - 1) // block * block
-        extension = request.num_prompt_tokens // block * block
-        return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+        else:
+            block = self.scheduler_block_size
+            resend = (request.num_prompt_tokens - 1) // block * block
+            extension = request.num_prompt_tokens // block * block
+            native = tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+        # Publication positions are absolute, not Eagle lookup candidates.
+        # Merge after native replay back-off so the connector's state is not shifted.
+        return tuple(
+            dict.fromkeys(
+                (*native, *self.get_recurrent_publication_boundaries(request))
+            )
+        )
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

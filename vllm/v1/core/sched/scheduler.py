@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -39,6 +40,13 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.recurrent_prefill_checkpoint import (
+    COALESCED_CHECKPOINT_CAPACITY,
+    CheckpointPlan,
+    continuation_layout,
+    prefill_checkpoint_plan,
+    validate_coalescing_config,
+)
 from vllm.v1.core.sched.compute_fairness import (
     ComputeServiceClass,
     PrefillComputeShareController,
@@ -63,6 +71,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -118,6 +127,9 @@ def _build_kv_connector_block_state(
 
 
 class Scheduler(SchedulerInterface):
+    _kda_coalescing_enabled = False
+    _kda_coalescing_exclusive = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -367,6 +379,9 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            self.kv_cache_manager.coordinator.recurrent_publication_boundary_provider = (
+                getattr(self.connector, "get_recurrent_publication_boundaries", None)
+            )
             if self.kv_cache_manager.boundary_checkpoints is not None:
                 self.connector.bind_boundary_checkpoint_cache(self.kv_cache_manager)
 
@@ -426,8 +441,10 @@ class Scheduler(SchedulerInterface):
             or (
                 speculative_config.method == "mtp"
                 and speculative_config.draft_model_config is not None
-                and "Glm5NextMTPModel"
-                in (speculative_config.draft_model_config.hf_config.architectures or ())
+                and bool(
+                    {"Glm5NextMTPModel", "Qwen3_8FlashNextMTP", "Qwen4ExpMTP"}
+                    & set(speculative_config.draft_model_config.hf_config.architectures or ())
+                )
             )
         )
         self.mamba_has_prefill_checkpoint_blocks = (
@@ -491,6 +508,125 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._kda_coalescing_enabled = validate_coalescing_config(vllm_config)
+        self._kda_coalescing_origins: dict[str, Request] = {}
+        self._kda_coalescing_exclusive = False
+        self._kda_coalescing_log_remaining = (
+            envs.VLLM_B12X_KDA_PREFILL_COALESCING_LOG_LIMIT
+            if self._kda_coalescing_enabled
+            else 0
+        )
+        if self._kda_coalescing_enabled:
+            recurrent_groups = [
+                group.kv_cache_spec
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ]
+            if not recurrent_groups or any(
+                spec.num_prefill_checkpoint_blocks != COALESCED_CHECKPOINT_CAPACITY
+                or spec.block_size != self.cache_config.block_size
+                for spec in recurrent_groups
+            ):
+                raise ValueError(
+                    "KDA coalescing requires four-checkpoint recurrent groups "
+                    "on one block grid"
+                )
+
+    def _recurrent_checkpoint_plan(
+        self, request: Request, start: int, end: int
+    ) -> CheckpointPlan | None:
+        """Plan sparse retained states for one exclusive pure-prompt chunk."""
+        if (
+            not self._kda_coalescing_enabled
+            or not self._kda_coalescing_exclusive
+            or request.use_boundary_checkpoints
+            or request.num_preemptions
+            or request.has_encoder_inputs
+            or request.resumable
+            or request.num_tokens != request.num_prompt_tokens
+            or request.spec_token_ids
+            or request.num_computed_tokens != start
+        ):
+            return None
+        if (
+            start
+            and self._kda_coalescing_origins.get(request.request_id) is not request
+        ):
+            return None
+        managers = [
+            manager
+            for manager in self.kv_cache_manager.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        ]
+        boundaries = [request.num_prompt_tokens - 1]
+        if request.shared_prefix_boundary:
+            boundaries.append(request.shared_prefix_boundary)
+        publications = tuple(
+            sorted(
+                {
+                    position
+                    for manager in managers
+                    for position in manager._expand_reachable_boundaries(boundaries)
+                }
+                | set(
+                    self.kv_cache_manager.coordinator.get_recurrent_publication_boundaries(
+                        request
+                    )
+                )
+            )
+        )
+        plan = prefill_checkpoint_plan(
+            start=start,
+            end=end,
+            prompt=request.num_prompt_tokens,
+            num_tokens=request.num_tokens,
+            block_size=self.cache_config.block_size,
+            publications=publications,
+            shared_prefix_boundary=request.shared_prefix_boundary,
+        )
+        if plan is None:
+            return None
+        for manager in managers:
+            assert isinstance(manager.kv_cache_spec, MambaSpec)
+            if (
+                request.request_id in manager._partial_hit_reqs
+                or manager.kv_cache_spec.num_prefill_checkpoint_blocks < len(plan[2])
+            ):
+                return None
+            if start:
+                if request.request_id not in manager._allocated_block_reqs:
+                    return None
+                try:
+                    continuation_layout(
+                        manager.req_to_blocks[request.request_id],
+                        plan,
+                        manager.block_size,
+                        manager.num_speculative_blocks,
+                    )
+                except ValueError:
+                    return None
+            elif manager.req_to_blocks.get(request.request_id):
+                return None
+        return plan
+
+    def _record_coalescing_origin(
+        self, request: Request, computed: int, local: int, external: int, loading: bool
+    ) -> None:
+        if not self._kda_coalescing_enabled:
+            return
+        self._kda_coalescing_origins.pop(request.request_id, None)
+        if (
+            not loading
+            and computed == 0
+            and local == 0
+            and external == 0
+            and not request.num_preemptions
+            and request.status == RequestStatus.WAITING
+            and not request.resumable
+            and not request.has_encoder_inputs
+            and request.num_tokens == request.num_prompt_tokens
+        ):
+            self._kda_coalescing_origins[request.request_id] = request
 
     def _mamba_block_aligned_split(
         self,
@@ -512,6 +648,14 @@ class Scheduler(SchedulerInterface):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
+        if (
+            getattr(self, "_kda_coalescing_enabled", False)
+            and not num_new_local_computed_tokens
+            and not num_external_computed_tokens
+            and self._recurrent_checkpoint_plan(request, start, start + num_new_tokens)
+            is not None
+        ):
+            return num_new_tokens
         if request.use_boundary_checkpoints:
             # Running-state migration still happens in the worker, but these
             # requests publish only semantic endpoints. Stop exactly at the
@@ -641,6 +785,28 @@ class Scheduler(SchedulerInterface):
                 if start < position < end
             }
             if use_internal_checkpoint:
+                # Packed export and allocation share these exact columns. A
+                # state exported by every recurrent group needs no extra split.
+                exported_by_all: set[int] | None = None
+                for manager in managers:
+                    spec = manager.kv_cache_spec
+                    if spec.num_prefill_checkpoint_blocks <= 1:
+                        exported_by_all = set()
+                        break
+                    try:
+                        columns = spec.prefill_checkpoint_indices(start, end)
+                    except ValueError:
+                        exported_by_all = set()
+                        break
+                    exported = {(column + 1) * manager.block_size for column in columns}
+                    exported_by_all = (
+                        exported
+                        if exported_by_all is None
+                        else exported_by_all & exported
+                    )
+                if exported_by_all:
+                    reuse_stops.difference_update(exported_by_all)
+                    stops = tuple(s for s in stops if s not in exported_by_all)
                 # The worker's checkpoint grid belongs to each recurrent group.
                 internal_positions = {
                     end // manager.block_size * manager.block_size
@@ -653,6 +819,15 @@ class Scheduler(SchedulerInterface):
                     if internal is not None and internal > start:
                         reuse_stops.discard(internal)
             stops = (*stops, *reuse_stops)
+        # Optional publications require an actual state at their exact boundary.
+        # Keep these stops even when an internal checkpoint has a different
+        # Eagle-shifted position. Packed coalescing includes the same hints above.
+        stops = (
+            *stops,
+            *self.kv_cache_manager.coordinator.get_recurrent_publication_boundaries(
+                request
+            ),
+        )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
@@ -776,6 +951,10 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        self._kda_coalescing_exclusive = (
+            self._kda_coalescing_enabled
+            and len(self.running) + len(self.waiting) + len(self.skipped_waiting) == 1
+        )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -794,6 +973,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        recurrent_checkpoint_plans: dict[str, CheckpointPlan] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         separate_draft_input_tokens = 0
@@ -1085,10 +1265,16 @@ class Scheduler(SchedulerInterface):
                 # Schedule newly needed KV blocks for the request.
                 with record_function_or_nullcontext("schedule: allocate_slots"):
                     while True:
+                        checkpoint_plan = self._recurrent_checkpoint_plan(
+                            request,
+                            request.num_computed_tokens,
+                            request.num_computed_tokens + num_new_tokens,
+                        )
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
                             num_new_tokens,
                             num_lookahead_tokens=self.num_lookahead_tokens,
+                            recurrent_checkpoint_plan=checkpoint_plan,
                         )
 
                         if new_blocks is not None:
@@ -1143,6 +1329,7 @@ class Scheduler(SchedulerInterface):
                                     )
                                 req_to_new_blocks.pop(preempted_req_id)
                                 scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                                recurrent_checkpoint_plans.pop(preempted_req_id, None)
                                 preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                     preempted_req_id, None
                                 )
@@ -1185,6 +1372,8 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
                 req_to_new_blocks[request_id] = new_blocks
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if checkpoint_plan is not None:
+                    recurrent_checkpoint_plans[request_id] = checkpoint_plan
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 draft_input_budget -= separate_draft_input_tokens
@@ -1652,6 +1841,17 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                checkpoint_plan = (
+                    None
+                    if load_kv_async
+                    or num_new_local_computed_tokens
+                    or num_external_computed_tokens
+                    else self._recurrent_checkpoint_plan(
+                        request,
+                        num_computed_tokens,
+                        num_computed_tokens + num_new_tokens,
+                    )
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1695,6 +1895,7 @@ class Scheduler(SchedulerInterface):
                             for r in self.running
                         )
                     ),
+                    recurrent_checkpoint_plan=checkpoint_plan,
                 )
 
                 if new_blocks is None:
@@ -1739,6 +1940,13 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens - external_boundary_hit_tokens,
                     )
 
+                self._record_coalescing_origin(
+                    request,
+                    num_computed_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                    load_kv_async,
+                )
                 request_queue.remove_request(request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -1831,6 +2039,9 @@ class Scheduler(SchedulerInterface):
                     # maintain a separate micro-prefill budget.
                     token_budget = 0
                     break
+
+                if checkpoint_plan is not None:
+                    recurrent_checkpoint_plans[request_id] = checkpoint_plan
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
@@ -2017,6 +2228,11 @@ class Scheduler(SchedulerInterface):
                 compute_service_class = "decode"
 
         scheduler_output = SchedulerOutput(
+            recurrent_prefill_checkpoint_plans={
+                request_id: plan
+                for request_id, plan in recurrent_checkpoint_plans.items()
+                if request_id in num_scheduled_tokens
+            },
             scheduled_new_reqs=new_reqs_data,
             boundary_logits_only=bool(
                 new_reqs_data
@@ -2077,6 +2293,23 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if (
+            scheduler_output.recurrent_prefill_checkpoint_plans
+            and self._kda_coalescing_log_remaining > 0
+        ):
+            for (
+                request_id,
+                plan,
+            ) in scheduler_output.recurrent_prefill_checkpoint_plans.items():
+                if self._kda_coalescing_log_remaining <= 0:
+                    break
+                logger.info(
+                    "KDA prefill coalescing request=%s span=%d checkpoints=%s",
+                    request_id,
+                    plan[1] - plan[0],
+                    plan[2],
+                )
+                self._kda_coalescing_log_remaining -= 1
         controller = self.compute_share_controller
         if controller is not None and controller.auto_enabled:
             # Sample after cache lookup and request-state transitions. Before
@@ -3472,6 +3705,8 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self._kda_coalescing_enabled:
+            self._kda_coalescing_origins.pop(request.request_id, None)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return
@@ -3944,6 +4179,8 @@ class Scheduler(SchedulerInterface):
 
         This method scans the given requests, detects those with invalid blocks
         and adjusts their `num_computed_tokens` to the longest valid prefix.
+        Hybrid requests restart from zero because a failed recurrent state
+        does not identify a valid endpoint shared by every cache group.
         For observability, it also accumulates the total number of tokens that
         will need to be recomputed across all affected requests.
 
@@ -3956,8 +4193,9 @@ class Scheduler(SchedulerInterface):
             requests: The set of requests to scan for invalid blocks.
             invalid_block_ids: IDs of invalid blocks.
             num_scheduled_tokens: req_id -> number of scheduled tokens.
-            evict_blocks: Whether to collect blocks for eviction (False for
-                async requests which aren't cached yet).
+            evict_blocks: Whether to collect single-group blocks for eviction.
+                Hybrid recovery always discards cached dependencies, including
+                any locally cached prefix preceding an asynchronous load.
 
         Returns:
             tuple:
@@ -3984,39 +4222,43 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # One block-id list per KV cache group.
-            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
+            grouped_block_ids = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            if len(req_block_ids_per_group) > 1:
-                # No single truncation point exists across groups, so the whole
-                # request is recomputed. Blocks are still marked, so a request
-                # sharing one of them is rescheduled too.
-                request_invalid_block_ids = {
+            if len(grouped_block_ids) > 1:
+                frontier = max(0, req_num_computed_tokens)
+                managers = self.kv_cache_manager.coordinator.single_type_managers
+                null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+                used_blocks = {
                     block_id
-                    for req_block_ids in req_block_ids_per_group
-                    for block_id in req_block_ids
-                    if block_id != null_block_id and block_id in invalid_block_ids
+                    for ids, manager in zip(grouped_block_ids, managers, strict=True)
+                    for block_id in ids[
+                        : (frontier + manager.block_size - 1) // manager.block_size
+                    ]
+                    if block_id != null_block_id
                 }
-                if request_invalid_block_ids:
-                    marked_invalid_block_ids |= request_invalid_block_ids
-                    total_affected_tokens += req_num_computed_tokens
-                    request.num_computed_tokens = 0
-                    if evict_blocks:
-                        for req_block_ids in req_block_ids_per_group:
-                            blocks_to_evict.update(
-                                block_id
-                                for block_id in req_block_ids
-                                if block_id != null_block_id
-                            )
-                    affected_req_ids.add(req_id)
+                if used_blocks.isdisjoint(invalid_block_ids):
+                    continue
+                marked_invalid_block_ids.update(used_blocks & invalid_block_ids)
+                request.num_computed_tokens = 0
+                affected_req_ids.add(req_id)
+                total_affected_tokens += frontier
+                # Discard cached dependencies even for asynchronous loads:
+                # their local prefix may contain hashed recurrent history.
+                # Eviction removes cache identities, never read/write leases.
+                blocks_to_evict.update(
+                    block_id
+                    for ids in grouped_block_ids
+                    for block_id in ids
+                    if block_id != null_block_id
+                )
                 continue
 
-            (req_block_ids,) = req_block_ids_per_group
+            (req_block_ids,) = grouped_block_ids
 
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
@@ -4103,7 +4345,7 @@ class Scheduler(SchedulerInterface):
             for req in self.skipped_waiting
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         )
-        async_failed_req_ids, num_failed_tokens, _ = (
+        async_failed_req_ids, num_failed_tokens, async_blocks_to_evict = (
             self._update_requests_with_invalid_blocks(
                 async_load_reqs,
                 invalid_block_ids,
@@ -4128,10 +4370,23 @@ class Scheduler(SchedulerInterface):
         if not total_failed_requests:
             return set()
 
-        # evict invalid blocks and downstream dependent blocks from cache
-        # only when not using recompute policy (where blocks will be recomputed
-        # and reused by other requests sharing them)
-        if sync_blocks_to_evict and not self.recompute_kv_load_failures:
+        if self.kv_cache_manager.num_kv_cache_groups > 1:
+            self.kv_cache_manager.evict_blocks(
+                async_blocks_to_evict | sync_blocks_to_evict
+            )
+            if self.recompute_kv_load_failures:
+                # Synchronous callers can share cached pages. Reallocate via
+                # normal preemption instead of overwriting those pages from
+                # token zero. Async callers retain all blocks until every
+                # worker reports receive completion, then free them on retry.
+                for request in list(self.running):
+                    if request.request_id in sync_failed_req_ids:
+                        self.running.remove(request)
+                        self._preempt_request(
+                            request, time.monotonic(), drop_stale_output=True
+                        )
+        elif sync_blocks_to_evict and not self.recompute_kv_load_failures:
+            # Single-group recomputation retains its shared valid prefix.
             self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
 
         if should_fail:

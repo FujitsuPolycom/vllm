@@ -7,6 +7,10 @@ from types import SimpleNamespace
 import torch
 
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.kv_cache_interface import (
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 
 
 class B12xGdnMixedMetadata:
@@ -91,6 +95,9 @@ class B12xGdnMixedMetadata:
         draft_tokens_cpu: torch.Tensor | None,
         *,
         checkpoint_block_size: int | None,
+        checkpoint_hash_block_size: int | None = None,
+        checkpoint_alignment: int | None = 16,
+        drop_eagle_checkpoint_block: bool = False,
     ) -> None:
         starts = common.query_start_loc_cpu[: common.num_reqs + 1].tolist()
         if len(starts) - 1 > self.max_seqs or starts[-1] > self.max_tokens:
@@ -161,20 +168,27 @@ class B12xGdnMixedMetadata:
             if upper is None:
                 raise ValueError("GDN checkpoints require CPU sequence-length bounds")
             lengths = upper.tolist()
+            hash_size = checkpoint_hash_block_size or checkpoint_block_size
             for row in non_spec_rows:
                 query_len = starts[row + 1] - starts[row]
                 length = lengths[row]
-                offset = length // checkpoint_block_size * checkpoint_block_size - (
-                    length - query_len
+                query_start = length - query_len
+                position = get_mamba_prefill_checkpoint_position(
+                    length, hash_size, drop_eagle_checkpoint_block
                 )
-                valid = (
-                    length % checkpoint_block_size
-                    and 0 < offset < query_len
-                    and offset % 16 == 0
+                valid = is_mamba_prefill_checkpoint_valid(
+                    query_start,
+                    length,
+                    position,
+                    hash_size,
+                    checkpoint_block_size,
+                    checkpoint_alignment,
                 )
-                checkpoint_offsets.append(offset if valid else 0)
+                checkpoint_offsets.append(position - query_start if valid else 0)
                 checkpoint_columns.append(
-                    length // checkpoint_block_size - 1 if valid else 0
+                    (length + checkpoint_block_size - 1) // checkpoint_block_size - 2
+                    if valid
+                    else 0
                 )
         self._copy_list(self.checkpoint.checkpoint_offsets, checkpoint_offsets)
         self._copy_list(self.checkpoint_columns, checkpoint_columns)
