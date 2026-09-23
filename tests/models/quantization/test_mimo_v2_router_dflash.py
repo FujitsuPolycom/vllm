@@ -147,7 +147,9 @@ def test_dflash_context_values_scaled_once(monkeypatch, value_scale, per_layer):
         _rope_is_neox=True,
         _attn_layers=inner,
         layers=[
-            SimpleNamespace(self_attn=SimpleNamespace(v_scale=value_scale))
+            SimpleNamespace(
+                self_attn=SimpleNamespace(v_scale=value_scale, rotary_emb=object())
+            )
             for _ in range(2)
         ],
     )
