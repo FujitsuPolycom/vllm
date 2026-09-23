@@ -8,6 +8,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
 )
@@ -35,6 +36,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
+from vllm.utils.flashinfer import has_flashinfer_b12x_moe_activation
 
 logger = init_logger(__name__)
 
@@ -214,6 +216,14 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.EMULATION,
         NvFp4MoeBackend.HUMMING,
     }
+
+    # B12x applies the clamp only for SwiGLU-OAI and only when the installed
+    # FlashInfer wrapper exposes the corresponding activation parameters.
+    if (
+        config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        and has_flashinfer_b12x_moe_activation()
+    ):
+        NVFP4_BACKENDS_WITH_CLAMP.add(NvFp4MoeBackend.FLASHINFER_B12X)
 
     if config.swiglu_limit is not None:
         AVAILABLE_BACKENDS = [

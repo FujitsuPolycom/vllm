@@ -24,7 +24,7 @@ logger = init_logger(__name__)
 # Larger batches fall back to the eager allreduce + RMSNorm path.
 MINIMAX_QK_NORM_MAX_TOKEN_NUM = 2048
 
-_MINIMAX_FUSED_AR_RMS_QK = getattr(torch.ops._C, "minimax_allreduce_rms_qk", None)
+_MINIMAX_FUSED_AR_RMS_QK = None  # Disabled for DGX Spark multi-node TP
 
 
 def _all_reduce_variance(var: torch.Tensor) -> torch.Tensor:

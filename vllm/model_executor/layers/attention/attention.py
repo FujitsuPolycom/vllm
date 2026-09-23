@@ -680,6 +680,18 @@ class Attention(nn.Module, AttentionLayerBase):
             sw_block_size = _largest_kernel_block_within(
                 self.attn_backend, sw_per_token, page_budget, block_size
             )
+            # spark-vllm-docker: preserve unsupported-primary SWA fallback.
+            # Keep #53007's primary-size choice when the backend supports it.
+            # Otherwise start small so page unification can scale the block
+            # exactly, instead of padding a larger non-divisor (e.g. 64 vs
+            # 1648 tokens for FlashInfer on Qwen3.8 + DFlash2).
+            # Explicitly padded skip-quant pages still prefer the largest fit.
+            if shared_page is None and sw_block_size != block_size:
+                kernel_sizes = self.attn_backend.get_supported_kernel_block_sizes()
+                sw_block_size = min(
+                    (s if isinstance(s, int) else s.base for s in kernel_sizes),
+                    default=block_size,
+                )
             return SlidingWindowSpec(
                 block_size=sw_block_size,
                 num_kv_heads=self.num_kv_heads,

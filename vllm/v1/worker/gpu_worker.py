@@ -705,6 +705,50 @@ class Worker(WorkerBase):
         # compiled modules, and other persistent device allocations after the
         # main activation profile. Include their retained footprint before the
         # remaining memory is assigned to production KV cache storage.
+        # spark-vllm-docker: post-profile cleanup before KV sizing
+        if self.device_config.device_type == "cuda":
+            before_cleanup = profile_result.after_profile.free_memory
+            if hasattr(self.model_runner, "_cleanup_profiling_kv_cache"):
+                self.model_runner._cleanup_profiling_kv_cache()
+            gc.collect()
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+            profile_result.after_profile.measure()
+            diff_from_create = (
+                profile_result.after_profile - profile_result.before_create
+            )
+            profile_result.non_torch_increase = (
+                diff_from_create.non_torch_memory
+            )
+            if hasattr(profile_result, "transient_peak_headroom"):
+                # Newer vLLM measures all persistent allocations from
+                # device free memory, including Torch allocations.
+                profile_result.total_consumed = (
+                    profile_result.before_create.free_memory
+                    - profile_result.after_profile.free_memory
+                )
+                profile_result.non_kv_cache_memory = (
+                    profile_result.total_consumed
+                    + profile_result.transient_peak_headroom
+                )
+            else:
+                # Compatibility with older profiling results.
+                profile_result.non_kv_cache_memory = (
+                    profile_result.non_torch_increase
+                    + profile_result.torch_peak_increase
+                    + profile_result.weights_memory
+                )
+            cleanup_freed = (
+                profile_result.after_profile.free_memory - before_cleanup
+            )
+            if cleanup_freed > 0:
+                logger.info_once(
+                    "Freed %.2f GiB before KV cache sizing; "
+                    "non-torch profile increase is %.2f GiB.",
+                    cleanup_freed / (1024**3),
+                    profile_result.non_torch_increase / (1024**3),
+                )
+
         final_profile_snapshot = MemorySnapshot(device=self.device)
         late_persistent_memory = max(
             profile_result.after_profile.free_memory
@@ -876,6 +920,23 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        # spark-vllm-docker: pre-KV cache allocator cleanup
+        if self.device_config.device_type == "cuda":
+            gc.collect()
+            torch.cuda.synchronize(self.device)
+            cached_memory = max(
+                torch.cuda.memory_reserved(self.device)
+                - torch.cuda.memory_allocated(self.device),
+                0,
+            )
+            torch.cuda.empty_cache()
+            if cached_memory > 0:
+                logger.info_once(
+                    "Cleared %.2f GiB of cached CUDA allocator memory before "
+                    "KV cache allocation.",
+                    cached_memory / (1024**3),
+                )
+
 
         # Reclaim temporary profiling/tuning allocations on every rank before
         # allocating the serving pool, including when its size is explicit.
