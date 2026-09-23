@@ -920,6 +920,8 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
         prefix, qkv_kind = name.rsplit(".", 1)
         entry = fp8_qkv_proj_dict.setdefault(prefix, {})
+        if tensor.device.type not in ("cpu", "meta"):
+            tensor = materialize_weight(tensor)
         entry[qkv_kind] = tensor
         if "weight" not in entry or "weight_scale_inv" not in entry:
             # Still waiting for the other param.

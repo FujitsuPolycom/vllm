@@ -245,6 +245,18 @@ def test_malformed_scale_grid_rejected(scale_rows):
 @pytest.mark.parametrize("scale_first", [False, True])
 def test_fused_qkv_loaders(monkeypatch, loader, tp_size, scale_first):
     """Both real loading callers must use export chunks, in either file order."""
+    _exercise_fused_qkv_loaders(monkeypatch, loader, tp_size, scale_first, "cpu", False)
+
+
+@pytest.mark.parametrize("loader", ["target", "mtp"])
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_fused_qkv_loaders_own_borrowed_accelerator_views(monkeypatch, loader, scale_first):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for borrowed checkpoint staging")
+    _exercise_fused_qkv_loaders(monkeypatch, loader, 4, scale_first, "cuda", True)
+
+
+def _exercise_fused_qkv_loaders(monkeypatch, loader, tp_size, scale_first, device, overwrite):
     from types import MethodType, SimpleNamespace
 
     import vllm.model_executor.models.mimo_v2 as target
@@ -290,9 +302,20 @@ def test_fused_qkv_loaders(monkeypatch, loader, tp_size, scale_first):
             model.model.mtp.layers = torch.nn.ModuleList([layer])
             prefix = "model.mtp.layers.0.self_attn.qkv_proj"
             load = mtp.MiMoV2MTP.load_weights
-        tensors = [(prefix + ".weight", weight), (prefix + ".weight_scale_inv", scale)]
-        loaded = load(model, reversed(tensors) if scale_first else tensors)
+        model.to(device)
+        tensors = [(prefix + ".weight", weight.to(device)),
+                   (prefix + ".weight_scale_inv", scale.to(device))]
+        ordered = list(reversed(tensors)) if scale_first else tensors
+
+        def stream():
+            yield ordered[0]
+            if overwrite:
+                # Recycle the staging slot before the paired tensor arrives.
+                ordered[0][1].view(torch.uint8).zero_()
+            yield ordered[1]
+
+        loaded = load(model, stream())
         assert loaded == {name for name, _ in tensors}
-        got = _dequantize(attn.qkv_proj.weight, attn.qkv_proj.weight_scale_inv)
+        got = _dequantize(attn.qkv_proj.weight.cpu(), attn.qkv_proj.weight_scale_inv.cpu())
         expected = _owned_rows(truth, *geometry, rank, tp_size)
         assert _relative_l2(got, expected) <= TOL

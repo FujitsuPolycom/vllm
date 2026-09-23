@@ -38,6 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import (
@@ -306,6 +307,8 @@ class MiMoV2MTP(nn.Module):
                     ):
                         continue
                     entry = pending_qkv_proj.setdefault(prefix, {})
+                    if loaded_weight.device.type not in ("cpu", "meta"):
+                        loaded_weight = materialize_weight(loaded_weight)
                     entry[kind] = loaded_weight
                     if "weight" not in entry or "weight_scale_inv" not in entry:
                         # Waiting for the other half of the fused projection.

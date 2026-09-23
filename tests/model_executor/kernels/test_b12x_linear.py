@@ -2929,6 +2929,7 @@ def test_b12x_fp8_unplanned_rows_use_the_capacity_regime_and_replay(recipe):
         declared = getattr(layer, attr)
         assert declared.plan.token_counts == (4, capacity)
         assert declared.plan.prepared is not None
+        graph_rows = 20
         session.freeze()
         with kernel_resolution_guard("FP8 prepared regime execution"):
             for rows in (4, 11, 57, capacity):
@@ -2955,10 +2956,9 @@ def test_b12x_fp8_unplanned_rows_use_the_capacity_regime_and_replay(recipe):
             finally:
                 graph.reset()
 
-        assert plans == declared
-        if recipe == "block":
-            with pytest.raises(ValueError, match="planned M capacity"):
-                run(capacity + 1)
+        assert getattr(layer, attr) is declared
+        with pytest.raises(ValueError, match="exceed capacity"):
+            run(capacity + 1)
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp4"])
