@@ -40,6 +40,9 @@ def configure(model, config, mode: str) -> None:
         or config.model_config.dtype != torch.bfloat16
     ):
         error = "Qwen HC ownership requires BF16 TP4/PP1/DP1/DCP1/PCP1"
+    workspace = getattr(model, "hyper_connection_workspace", None)
+    if mode == "shard" and getattr(workspace, "tp_size", 1) > 1:
+        error = "Qwen HC row ownership cannot be combined with HC projection sharding"
     votes = [None] * group.world_size
     torch.distributed.all_gather_object(votes, (mode, error), group=group.cpu_group)
     if any(vote != (mode, None) for vote in votes):
