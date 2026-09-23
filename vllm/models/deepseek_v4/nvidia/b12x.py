@@ -1248,7 +1248,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         from b12x.preparation import require_prepared
 
         rows = int(o.shape[0])
-        plan = self._b12x_wo_plans.get(rows, self._b12x_wo_plans.get(None))
+        plan = self._b12x_wo_plan(rows)
         if plan is None:
             raise PreparationResourceUnavailableError(
                 "B12x WO projection has no prepared capacity plan"

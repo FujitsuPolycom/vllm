@@ -352,7 +352,8 @@ def test_indexer_primer_restores_live_cache(layer_id, workspace_init):
             torch.testing.assert_close(cache, original, rtol=0, atol=0)
 
 
-def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
+@pytest.mark.parametrize("include_capacity", [False, True])
+def test_wo_prefill_remainders_reuse_declared_chunk_capacity(include_capacity):
     from vllm.models.deepseek_v4_1 import attention
     from vllm.utils.b12x import B12xWorkload
 
@@ -376,7 +377,7 @@ def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
     )
     workload = B12xWorkload(
         stage="weights",
-        token_counts=(1, 8, 16),
+        token_counts=(1, 8, 16, 4096) if include_capacity else (1, 8, 16),
         fixed_token_counts=(1, 8, 16),
         output_dtype=torch.bfloat16,
         max_tokens=4096,
@@ -405,6 +406,9 @@ def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
     assert prefill.query.max_tokens == 4096 and prefill.query.dynamic_tokens
     for rows in (127, 128, 129, 3575, 3582, 4096):
         assert module._wo_plan(rows, is_prefill=True) is prefill
-    assert declarations == [(1, False), (8, False), (16, False), (4096, True)]
+    expected = [(1, False), (8, False), (16, False)]
+    if include_capacity:
+        expected.append((4096, False))
+    assert declarations == [*expected, (4096, True)]
     assert not module._wo_plan(1).query.dynamic_tokens
     assert module._wo_plan(8).query.max_tokens == 8

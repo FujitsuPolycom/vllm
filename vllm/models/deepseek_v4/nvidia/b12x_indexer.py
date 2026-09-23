@@ -429,7 +429,7 @@ class B12xC4SparseIndexer(nn.Module):
 
         capacities = {
             "decode": tuple(
-                sorted(
+                sorted({
                     min(workload.max_tokens, rows)
                     for rows in {
                         workload.max_seqs,
@@ -438,7 +438,7 @@ class B12xC4SparseIndexer(nn.Module):
                         *workload.fixed_token_counts,
                     }
                     if rows > 0
-                )
+                })
             ),
             "prefill": (workload.max_tokens,),
         }

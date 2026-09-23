@@ -27,7 +27,6 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
     DeepseekV32IndexerMetadataBuilder,
-    split_indexer_prefill_chunks,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.worker.block_table import get_block_table_width
@@ -586,7 +585,7 @@ class B12xSparseIndexer(nn.Module):
         prepared_plans: dict[tuple[str, int], object] = {}
         capacities = {
             "decode": tuple(
-                sorted(
+                sorted({
                     min(workload.max_tokens, rows)
                     for rows in {
                         self._max_num_seqs,
@@ -595,7 +594,7 @@ class B12xSparseIndexer(nn.Module):
                         *workload.fixed_token_counts,
                     }
                     if rows > 0
-                )
+                })
             ),
             "prefill": (self._prefill_max_q_rows,),
         }

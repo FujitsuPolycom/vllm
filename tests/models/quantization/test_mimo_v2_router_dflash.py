@@ -71,6 +71,8 @@ def test_bf16_router_emits_fp32_logits(monkeypatch):
 
     monkeypatch.setattr(mimo, "FusedMoEFactory", Experts)
     module = mimo.MiMoV2MoE(vconfig)
+    # This fixture skips checkpoint post-processing and exercises plain F.linear.
+    module.gate.cpu_linear = torch.nn.functional.linear
     with torch.no_grad():
         module.gate.weight.copy_(torch.arange(256).view(8, 32) / 256)
     hidden = torch.linspace(-1, 1, 96).view(3, 32).bfloat16()

@@ -1643,7 +1643,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 name=f"{self.prefix}.wo.m{rows}", prepare_call=prepare, benchmark_call=prepare,
             ) for rows in token_counts
         ]
-        requests.append(self._wo_resolver.resolve(self.capacity).request(
+        requests.append(self._wo_resolver.capacity_plans[self.capacity].request(
             name=f"{self.prefix}.wo.prefill", prepare_call=prepare, benchmark_call=prepare,
         ))
         return B12xPreparationUnit(
@@ -1675,14 +1675,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
 
     def _wo_plan(self, rows: int, *, is_prefill: bool = False):
-        del is_prefill
+        if is_prefill and rows <= self.capacity:
+            return self._wo_resolver.capacity_plans[self.capacity]
         return self._wo_resolver.resolve(rows)
 
     def _o_proj(self, o, positions, *, is_prefill=False):
         from b12x.preparation import require_prepared
 
         rows = o.shape[0]
-        plan = self._wo_plans.get("prefill" if is_prefill else rows)
+        plan = self._wo_plan(rows, is_prefill=is_prefill)
         if plan is None or plan.prepared is None:
             raise PreparationResourceUnavailableError(
                 f"V4.1 WO projection is not prepared for {rows} rows "
