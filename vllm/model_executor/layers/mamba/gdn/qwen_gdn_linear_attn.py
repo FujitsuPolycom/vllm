@@ -3140,7 +3140,13 @@ def qwen_gdn_input_projections(
     qkvz_scratch, ba_scratch = get_b12x_projection_workspaces(
         hidden_states.shape[0], layer.in_proj_qkvz, layer.in_proj_ba
     )
-    if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
+    rows = hidden_states.shape[0]
+    captured_overlap = rows <= 16 and torch.cuda.is_current_stream_capturing()
+    paired_mxfp8 = 0 < rows <= 1023 and all(
+        getattr(getattr(projection, "b12x_linear", None), "recipe", None) == "mxfp8"
+        for projection in (layer.in_proj_qkvz, layer.in_proj_ba)
+    )
+    if not (captured_overlap or paired_mxfp8):
         with use_preallocated_workspace(qkvz_scratch):
             qkvz, _ = layer.in_proj_qkvz(hidden_states)
         with use_preallocated_workspace(ba_scratch):

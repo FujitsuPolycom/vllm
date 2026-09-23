@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -203,3 +204,91 @@ def test_prepare_flashinfer_cu_seqlens(
     assert result is not None
     assert result.dtype == expected_dtype
     assert (result is cu_seqlens) == preserves_storage
+
+
+@pytest.mark.parametrize("rows", [0, 1, 8, 16, 17, 64, 1023, 1024])
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize(
+    "recipes", [("mxfp8", "mxfp8"), ("nvfp4", "mxfp8"), (None, None)]
+)
+def test_gdn_projection_overlap_preserves_stream_and_scratch_ownership(
+    monkeypatch, rows, capturing, recipes
+):
+    """Paired MXFP8 expands overlap without changing other or large-row paths."""
+    events = []
+    active = {"stream": "main", "scratch": None}
+
+    def stream(name):
+        return SimpleNamespace(
+            name=name,
+            wait_stream=lambda other: events.append((name, "wait", other.name)),
+        )
+
+    main, side = stream("main"), stream("side")
+
+    @contextmanager
+    def stream_scope(selected):
+        before = active["stream"]
+        active["stream"] = selected.name
+        yield
+        active["stream"] = before
+
+    @contextmanager
+    def scratch_scope(selected):
+        before = active["scratch"]
+        active["scratch"] = selected
+        yield
+        active["scratch"] = before
+
+    outputs = {name: MagicMock() for name in ("qkvz", "ba")}
+
+    def projection(name, recipe):
+        def run(hidden_states):
+            assert active["scratch"] == name
+            events.append((name, "run", active["stream"]))
+            return outputs[name], None
+
+        result = MagicMock(side_effect=run)
+        result.b12x_linear = SimpleNamespace(recipe=recipe)
+        return result
+
+    layer = SimpleNamespace(
+        in_proj_qkvz=projection("qkvz", recipes[0]),
+        in_proj_ba=projection("ba", recipes[1]),
+    )
+    module = qwen_gdn_linear_attn
+    monkeypatch.setattr(
+        module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"layer": layer}),
+    )
+    monkeypatch.setattr(module, "_resolve_layer_name", lambda name: name)
+    monkeypatch.setattr(
+        module, "get_b12x_projection_workspaces", lambda *args: ("qkvz", "ba")
+    )
+    monkeypatch.setattr(module, "use_preallocated_workspace", scratch_scope)
+    monkeypatch.setattr(module, "aux_stream", lambda: side)
+    monkeypatch.setattr(module, "current_stream", lambda: main)
+    monkeypatch.setattr(module.torch.cuda, "stream", stream_scope)
+    monkeypatch.setattr(
+        module.torch.cuda, "is_current_stream_capturing", lambda: capturing
+    )
+    hidden = MagicMock(shape=(rows, 2560))
+    result = module.qwen_gdn_input_projections(hidden, 4096, 24, "layer")
+    assert result == (outputs["qkvz"], outputs["ba"])
+    overlap = (
+        capturing and rows <= 16 or (0 < rows <= 1023 and recipes == ("mxfp8", "mxfp8"))
+    )
+    if overlap:
+        assert events == [
+            ("side", "wait", "main"),
+            ("ba", "run", "side"),
+            ("qkvz", "run", "main"),
+            ("main", "wait", "side"),
+        ]
+        hidden.record_stream.assert_called_once_with(side)
+        outputs["ba"].record_stream.assert_called_once_with(main)
+    else:
+        assert events == [("qkvz", "run", "main"), ("ba", "run", "main")]
+        hidden.record_stream.assert_not_called()
+        outputs["ba"].record_stream.assert_not_called()

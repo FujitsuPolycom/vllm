@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-sparkring-mxfp8-gdn-overlap",
+  "category": "performance",
+  "summary": "Overlap prepared Qwen GDN MXFP8 input projections through 1023 rows",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "Uses the existing Qwen overlap setting and prepared stream/workspace owners. Non-MXFP8 and larger prefill paths retain their existing scheduling.",
+  "details": [
+    "Paired B12X MXFP8 projections can overlap in eager execution and captures above 16 rows.",
+    "The caller stream joins the auxiliary stream before returning either output. GPU correctness and performance qualification are recorded separately."
+  ],
+  "pull_requests": [],
+  "requires": []
+}
