@@ -166,6 +166,85 @@ def test_qwen_qsa_requires_atomic_checkpoint_connector(
             _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
 
 
+@pytest.fixture
+def aligned_qwen_sparkcache(monkeypatch):
+    from types import SimpleNamespace
+
+    connector = type(
+        "SparkContextCacheConnector",
+        (),
+        {
+            "__module__": "sparkcache.spark_context_cache_connector",
+            "supports_recurrent_boundary_blocks": True,
+            "supports_cuda_vmm": True,
+            "supports_request_boundary_checkpoints": classmethod(
+                lambda cls, config: False
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class", lambda config: connector
+    )
+    cfg = VllmConfig.__new__(VllmConfig)
+    cfg.kv_transfer_config = KVTransferConfig(
+        kv_connector="SparkContextCacheConnector",
+        kv_connector_module_path="sparkcache.spark_context_cache_connector",
+        kv_role="kv_both",
+    )
+    cfg.model_config = SimpleNamespace(
+        enable_cumem_allocator=False,
+        hf_text_config=SimpleNamespace(model_type="qwen3_8_flash_next_text"),
+    )
+    cfg.cache_config = CacheConfig(
+        mamba_cache_mode="align",
+        recurrent_checkpoint_policy="aligned",
+        enable_prefix_caching=True,
+    )
+    cfg.parallel_config = ParallelConfig(tensor_parallel_size=2)
+    return cfg, connector
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_qwen_aligned_sparkcache_remains_non_atomic(aligned_qwen_sparkcache, tp):
+    cfg, _ = aligned_qwen_sparkcache
+    cfg.parallel_config.tensor_parallel_size = tp
+    cfg._verify_kv_transfer_compat()
+    assert cfg.external_boundary_checkpoint_adapter_available is False
+
+
+@pytest.mark.parametrize(
+    "owner,attribute,value",
+    [
+        ("cache_config", "recurrent_checkpoint_policy", "request_boundaries"),
+        ("cache_config", "mamba_cache_mode", "none"),
+        ("cache_config", "enable_prefix_caching", False),
+        ("parallel_config", "decode_context_parallel_size", 2),
+        ("parallel_config", "pipeline_parallel_size", 2),
+        ("kv_transfer_config", "kv_connector_module_path", "unrelated.module"),
+        ("connector", "supports_recurrent_boundary_blocks", False),
+    ],
+)
+def test_qwen_aligned_exception_rejects_other_contracts(
+    aligned_qwen_sparkcache, owner, attribute, value
+):
+    cfg, connector = aligned_qwen_sparkcache
+    target = connector if owner == "connector" else getattr(cfg, owner)
+    setattr(target, attribute, value)
+    with pytest.raises(ValueError, match="atomic request-boundary"):
+        cfg._verify_kv_transfer_compat()
+
+
+def test_qwen_aligned_sparkcache_keeps_vmm_admission(
+    aligned_qwen_sparkcache, monkeypatch
+):
+    cfg, connector = aligned_qwen_sparkcache
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    cfg._verify_kv_transfer_compat()
+    connector.supports_cuda_vmm = False
+    with pytest.raises(ValueError, match="expandable_segments"):
+        cfg._verify_kv_transfer_compat()
+
+
 @pytest.mark.parametrize(
     "kv_connector", ["NixlConnector", "MooncakeConnectorV1", "SomeOOTConnector"]
 )

@@ -1257,10 +1257,35 @@ class VllmConfig:
             connector = KVConnectorFactory.get_connector_class(
                 self.kv_transfer_config
             )
-            if not connector.supports_request_boundary_checkpoints(self):
+            # The retained SparkCache adapter captures aligned recurrent
+            # blocks through source-bound read leases. It does not implement
+            # atomic target/draft request-boundary checkpoints.
+            aligned_sparkcache = (
+                self.kv_transfer_config.kv_connector == "SparkContextCacheConnector"
+                and self.kv_transfer_config.kv_connector_module_path
+                == "sparkcache.spark_context_cache_connector"
+                and connector.__module__ == "sparkcache.spark_context_cache_connector"
+                and connector.__name__ == "SparkContextCacheConnector"
+                and getattr(connector, "supports_recurrent_boundary_blocks", False)
+                is True
+                and self.cache_config.recurrent_checkpoint_policy == "aligned"
+                and self.cache_config.mamba_cache_mode == "align"
+                and self.cache_config.enable_prefix_caching
+                and self.parallel_config.tensor_parallel_size in (2, 4)
+                and self.parallel_config.decode_context_parallel_size == 1
+                and self.parallel_config.pipeline_parallel_size == 1
+                and self.parallel_config.data_parallel_size == 1
+                and self.parallel_config.prefill_context_parallel_size == 1
+                and self.kv_transfer_config.kv_role == "kv_both"
+            )
+            if (
+                not connector.supports_request_boundary_checkpoints(self)
+                and not aligned_sparkcache
+            ):
                 raise ValueError(
                     "Qwen QSA KV transfer requires an atomic request-boundary "
-                    "checkpoint connector"
+                    "checkpoint connector or the source-bound aligned "
+                    "SparkCache profile"
                 )
 
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can

@@ -380,8 +380,9 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
-            self.kv_cache_manager.coordinator.recurrent_publication_boundary_provider = (
-                getattr(self.connector, "get_recurrent_publication_boundaries", None)
+            coordinator = self.kv_cache_manager.coordinator
+            coordinator.recurrent_publication_boundary_provider = getattr(
+                self.connector, "get_recurrent_publication_boundaries", None
             )
             if self.kv_cache_manager.boundary_checkpoints is not None:
                 self.connector.bind_boundary_checkpoint_cache(self.kv_cache_manager)
@@ -447,7 +448,10 @@ class Scheduler(SchedulerInterface):
                 and speculative_config.draft_model_config is not None
                 and bool(
                     {"Glm5NextMTPModel", "Qwen3_8FlashNextMTP", "Qwen4ExpMTP"}
-                    & set(speculative_config.draft_model_config.hf_config.architectures or ())
+                    & set(
+                        speculative_config.draft_model_config.hf_config.architectures
+                        or ()
+                    )
                 )
             )
         )
@@ -638,6 +642,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        *,
+        max_prefill_tokens: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -718,7 +724,8 @@ class Scheduler(SchedulerInterface):
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
         if end < prefill_end and not use_internal_checkpoint:
-            max_prefill_tokens = self.max_num_scheduled_tokens
+            if max_prefill_tokens is None:
+                max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
@@ -986,6 +993,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         recurrent_checkpoint_plans: dict[str, CheckpointPlan] = {}
         token_budget = self.max_num_scheduled_tokens
+        prefill_step_token_limit = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         separate_draft_input_tokens = 0
         if spec is not None:
@@ -1094,6 +1102,9 @@ class Scheduler(SchedulerInterface):
             and self.prefill_fairness_max_tokens is not None
         ):
             token_budget = min(token_budget, self.prefill_fairness_max_tokens)
+            prefill_step_token_limit = min(
+                prefill_step_token_limit, self.prefill_fairness_max_tokens
+            )
             input_budget = min(
                 input_budget,
                 self.prefill_fairness_max_tokens + draft_slots,
@@ -1236,7 +1247,9 @@ class Scheduler(SchedulerInterface):
                 # Apply Mamba alignment before encoder caps.
                 if self.need_mamba_block_aligned_split:
                     num_new_tokens = self._mamba_block_aligned_split(
-                        request, num_new_tokens
+                        request,
+                        num_new_tokens,
+                        max_prefill_tokens=prefill_step_token_limit,
                     )
 
                 # Schedule encoder inputs.
@@ -1717,6 +1730,10 @@ class Scheduler(SchedulerInterface):
                             adaptive_defer_prefills = False
                             defer_prefills = legacy_defer_prefills
                             if self.prefill_fairness_max_tokens is not None:
+                                prefill_step_token_limit = min(
+                                    prefill_step_token_limit,
+                                    self.prefill_fairness_max_tokens,
+                                )
                                 token_budget = min(
                                     token_budget, self.prefill_fairness_max_tokens
                                 )
@@ -1798,6 +1815,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            max_prefill_tokens=prefill_step_token_limit,
                         )
                         if num_new_tokens == 0:
                             if not interleaved_local_prefill:
@@ -2109,6 +2127,9 @@ class Scheduler(SchedulerInterface):
             adaptive_defer_prefills = False
             defer_prefills = False
             if self.prefill_fairness_max_tokens is not None:
+                prefill_step_token_limit = min(
+                    prefill_step_token_limit, self.prefill_fairness_max_tokens
+                )
                 token_budget = min(token_budget, self.prefill_fairness_max_tokens)
                 input_budget = min(
                     input_budget,

@@ -71,6 +71,48 @@ def _establish_decode(scheduler, req_id: str = "decode"):
     return request
 
 
+@pytest.mark.parametrize("contended", [False, True])
+def test_prefill_quantum_preserves_mamba_aligned_progress(opt_model_path, contended):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        max_num_batched_tokens=16384,
+        max_model_len=32768,
+        max_num_prefill_tokens_per_step=512,
+        num_blocks=4096,
+    )
+    if contended:
+        _establish_decode(scheduler)
+    # Exercise the real scheduling/splitting call chain with a recurrent
+    # alignment larger than the fairness quantum. KV allocation stays CPU-only.
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.cache_config.block_size = 1600
+    scheduler.mamba_has_prefill_checkpoint_blocks = False
+    scheduler.mamba_partial_cache_hit = False
+    scheduler.mamba_fine_grained_prefix_cache = False
+    scheduler.use_eagle_block_drop = False
+    (prefill,) = create_requests(
+        num_requests=1, num_tokens=3602, req_ids=["aligned-prefill"]
+    )
+    scheduler.add_request(prefill)
+    chunks = []
+    for _ in range(12):
+        output = scheduler.schedule()
+        if prefill.request_id in output.num_scheduled_tokens:
+            chunks.append(output.num_scheduled_tokens[prefill.request_id])
+        if output.compute_service_class is not None:
+            scheduler.record_compute_time(
+                output.compute_service_class, 0.01, contended=output.compute_contention
+            )
+        _update(scheduler, output)
+        if len(chunks) >= (4 if contended else 1):
+            break
+    if contended:
+        assert chunks == [512, 512, 512, 64]
+        assert prefill.num_computed_tokens == 1600
+    else:
+        assert chunks == [3200]
+
+
 @pytest.mark.parametrize("share", [0.0, 1.0, -0.1, 1.1])
 def test_prefill_compute_share_rejects_invalid_values(share: float):
     with pytest.raises(ValueError, match="prefill_compute_share"):
@@ -81,8 +123,9 @@ def test_prefill_compute_share_rejects_invalid_values(share: float):
         )
 
 
-def test_prefill_compute_share_cli_contract():
+def test_prefill_compute_share_cli_contract(opt_model_path):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parser.set_defaults(model=opt_model_path)
 
     namespace = parser.parse_args(["--prefill-compute-share", "0.65"])
     engine_args = EngineArgs.from_cli_args(namespace)
@@ -90,8 +133,9 @@ def test_prefill_compute_share_cli_contract():
     assert engine_args.prefill_compute_share == pytest.approx(0.65)
 
 
-def test_prefill_compute_share_cli_accepts_auto():
+def test_prefill_compute_share_cli_accepts_auto(opt_model_path):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parser.set_defaults(model=opt_model_path)
 
     namespace = parser.parse_args(["--prefill-compute-share", "auto"])
     engine_args = EngineArgs.from_cli_args(namespace)
@@ -99,8 +143,9 @@ def test_prefill_compute_share_cli_accepts_auto():
     assert engine_args.prefill_compute_share == "auto"
 
 
-def test_prefill_compute_token_cap_cli_contract():
+def test_prefill_compute_token_cap_cli_contract(opt_model_path):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parser.set_defaults(model=opt_model_path)
 
     namespace = parser.parse_args(
         [
@@ -124,8 +169,9 @@ def test_prefill_compute_token_cap_requires_compute_share():
         )
 
 
-def test_prefill_interleave_cli_contract():
+def test_prefill_interleave_cli_contract(opt_model_path):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parser.set_defaults(model=opt_model_path)
 
     namespace = parser.parse_args(
         [
@@ -144,8 +190,9 @@ def test_prefill_interleave_cli_contract():
     assert engine_args.decode_refill_target == 8
 
 
-def test_prefill_interleave_cli_accepts_numeric_parallel_prefills():
+def test_prefill_interleave_cli_accepts_numeric_parallel_prefills(opt_model_path):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parser.set_defaults(model=opt_model_path)
 
     namespace = parser.parse_args(["--max-parallel-prefills", "4"])
     engine_args = EngineArgs.from_cli_args(namespace)
@@ -157,8 +204,9 @@ def test_prefill_interleave_cli_accepts_numeric_parallel_prefills():
     ("setting", "expected"),
     [("smooth", "smooth"), ("responsive", "responsive"), ("5", 5.0), ("0.2", 0.2)],
 )
-def test_prefill_compute_half_life_cli_contract(setting, expected):
+def test_prefill_compute_half_life_cli_contract(setting, expected, opt_model_path):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parser.set_defaults(model=opt_model_path)
 
     namespace = parser.parse_args(
         [
@@ -565,7 +613,7 @@ def test_prefill_turn_falls_back_when_prefill_is_alignment_blocked(
 
     scheduler.need_mamba_block_aligned_split = True
 
-    def block_prefill(request, num_new_tokens, *_args):
+    def block_prefill(request, num_new_tokens, *_args, **_kwargs):
         return 0 if request.request_id == prefill.request_id else num_new_tokens
 
     monkeypatch.setattr(scheduler, "_mamba_block_aligned_split", block_prefill)
@@ -1569,23 +1617,33 @@ def test_escape_respects_deferred_free_fences(opt_model_path):
     # batch before the previous batch's output is processed.
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
 
+    ownership = {
+        request.request_id: tuple(
+            tuple(group)
+            for group in scheduler.kv_cache_manager.get_blocks(
+                request.request_id
+            ).get_block_ids()
+        )
+        for request in (first_decode, second_decode)
+    }
     output = scheduler.schedule()
 
-    # The escape preempts both blocked decodes, but every freed block is
-    # behind the in-flight fence: the pool must not gain blocks mid-step, so
-    # this step still schedules nothing and no fence is bypassed.
+    # An in-flight writer prevents preemption as well as block reclamation.
     assert output.total_num_scheduled_tokens == 0
-    assert output.preempted_req_ids == {
-        first_decode.request_id,
-        second_decode.request_id,
-    }
+    assert not output.preempted_req_ids
+    for request in (first_decode, second_decode):
+        assert request.num_preemptions == 0
+        assert tuple(
+            tuple(group)
+            for group in scheduler.kv_cache_manager.get_blocks(
+                request.request_id
+            ).get_block_ids()
+        ) == ownership[request.request_id]
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
 
-    # Once the in-flight batch is processed, the fence drains and the next
-    # quantum resumes the first preempted decode; the rest of the state is
-    # served within bounded further progress.
+    # Completing the batch permits ordinary scheduling and preemption again;
+    # no blocks were detached while the writer was in flight.
     _update(scheduler, prefill_output)
-    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 2
 
     resumed_output = scheduler.schedule()
     assert resumed_output.total_num_scheduled_tokens > 0

@@ -160,6 +160,9 @@ def _split(
         mamba_prefill_checkpoint_alignment=(
             16 if num_prefill_checkpoint_blocks > 0 else None
         ),
+        kv_cache_manager=_make_hybrid_kv_cache_manager(
+            num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks
+        ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
