@@ -7,6 +7,7 @@ are packed along the last dim in the logical shape
 ``[num_blocks, num_kv_heads, block_size, head_size_qk + head_size_v]``.
 """
 
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import torch
@@ -16,22 +17,34 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import is_quantized_kv_cache
-from vllm.v1.attention.backend import AttentionLayer, AttentionType
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    AttentionLayer,
+    AttentionType,
+    CommonAttentionMetadata,
+)
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_diffkv,
 )
 from vllm.v1.attention.ops.triton_unified_attention_diffkv import (
     unified_attention_diffkv,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class TritonAttentionDiffKVMetadata(TritonAttentionMetadata):
+    # Empty for a single launch, otherwise decode prefix and prefill suffix.
+    partitions: tuple[TritonAttentionMetadata, ...] = ()
 
 
 class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
@@ -43,6 +56,14 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
     re-allocate with ``next_power_of_2(head_size_v)`` instead.
     """
 
+    # The partition boundary is host metadata and can vary at a fixed batch
+    # size. Mixed batches must not replay a full graph with stale partitions.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Adaptive verification preserves the total decode-prefix token count;
+    # pure decode still uses device offsets in one launch. See the backend
+    # supports_device_cpu_query_lens_mismatch contract.
+    supports_varlen_decode_cudagraph: ClassVar[bool] = True
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -51,6 +72,43 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+        # Split-KV scratch is indexed by query token, including verification
+        # tokens. Bound the extension by configured concurrency and the existing
+        # token/capture ceilings; never multiply the parent's sequence heuristic.
+        assert self.reorder_batch_threshold is not None
+        # Keep local attention at its inherited capacity: a short window may
+        # not amortize the extra split-KV launches and reduction. Full specs
+        # can also represent local attention when the hybrid allocator is off.
+        if (
+            self.reorder_batch_threshold > 1
+            and isinstance(kv_cache_spec, FullAttentionSpec)
+            and kv_cache_spec.sliding_window is None
+            and kv_cache_spec.attention_chunk_size is None
+        ):
+            scheduler = vllm_config.scheduler_config
+            verification_rows = min(
+                scheduler.max_num_seqs * self.reorder_batch_threshold,
+                scheduler.max_num_batched_tokens,
+            )
+            if self.decode_cudagraph_enabled:
+                capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes
+                assert capture_sizes
+                verification_rows = min(verification_rows, max(capture_sizes))
+            if verification_rows > self.seq_threshold_3D:
+                self.seq_threshold_3D = verification_rows
+                scalar_shape = (
+                    self.seq_threshold_3D,
+                    self.num_heads_q,
+                    self.num_par_softmax_segments,
+                )
+                self.softmax_segm_max = torch.empty(
+                    scalar_shape, dtype=torch.float32, device=device
+                )
+                self.softmax_segm_expsum = torch.empty(
+                    scalar_shape, dtype=torch.float32, device=device
+                )
 
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
         head_size_v_padded = next_power_of_2(head_size_v)
@@ -64,6 +122,63 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
             dtype=torch.float32,
             device=device,
         )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> TritonAttentionDiffKVMetadata:
+        base = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        metadata = TritonAttentionDiffKVMetadata(**vars(base))
+        capacity = min(
+            self.seq_threshold_3D,
+            self.softmax_segm_output.shape[0],
+            self.softmax_segm_max.shape[0],
+            self.softmax_segm_expsum.shape[0],
+        )
+        # The whole batch already fits, or there are no long queries to split.
+        assert self.reorder_batch_threshold is not None
+        if (
+            base.num_actual_tokens <= capacity
+            or base.max_query_len <= self.reorder_batch_threshold
+        ):
+            return metadata
+
+        num_decodes, _, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=self.reorder_batch_threshold
+            )
+        )
+        if not (0 < num_decode_tokens <= capacity and num_prefill_tokens > 0):
+            return metadata
+
+        # Slice requests and tokens together. Rebase the suffix once per build,
+        # outside attention, rather than synchronizing or allocating per layer.
+        decode = replace(
+            base,
+            num_actual_tokens=num_decode_tokens,
+            max_query_len=int(
+                (
+                    common_attn_metadata.query_start_loc_cpu[1 : num_decodes + 1]
+                    - common_attn_metadata.query_start_loc_cpu[:num_decodes]
+                ).max()
+            ),
+            query_start_loc=base.query_start_loc[: num_decodes + 1],
+            seq_lens=base.seq_lens[:num_decodes],
+            block_table=base.block_table[:num_decodes],
+            slot_mapping=base.slot_mapping[:num_decode_tokens],
+        )
+        prefill = replace(
+            base,
+            num_actual_tokens=num_prefill_tokens,
+            query_start_loc=base.query_start_loc[num_decodes:] - num_decode_tokens,
+            seq_lens=base.seq_lens[num_decodes:],
+            block_table=base.block_table[num_decodes:],
+            slot_mapping=base.slot_mapping[num_decode_tokens:],
+        )
+        metadata.partitions = (decode, prefill)
+        return metadata
 
 
 class TritonAttentionDiffKVBackend(TritonAttentionBackend):
@@ -194,7 +309,6 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
             "Cascade attention not supported for TritonAttentionDiffKVImpl"
         )
 
-        num_actual_tokens = attn_metadata.num_actual_tokens
         head_size_qk = self.head_size
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
 
@@ -205,28 +319,33 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
         key_cache = kv_cache[..., :head_size_qk]
         value_cache = kv_cache[..., head_size_qk : head_size_qk + head_size_v]
 
-        unified_attention_diffkv(
-            q=query[:num_actual_tokens],
-            k=key_cache,
-            v=value_cache,
-            out=output[:num_actual_tokens],
-            cu_seqlens_q=attn_metadata.query_start_loc,
-            seqused_k=attn_metadata.seq_lens,
-            softmax_scale=self.scale,
-            k_descale=layer._k_scale,
-            v_descale=layer._v_scale,
-            causal=True,
-            alibi_slopes=self.alibi_slopes,
-            use_alibi_sqrt=self.use_alibi_sqrt,
-            window_size=self.sliding_window,
-            block_table=attn_metadata.block_table,
-            softcap=self.logits_soft_cap,
-            sinks=self.sinks,
-            max_seqlen_q=attn_metadata.max_query_len,
-            seq_threshold_3D=attn_metadata.seq_threshold_3D,
-            num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
-            softmax_segm_output=attn_metadata.softmax_segm_output,
-            softmax_segm_max=attn_metadata.softmax_segm_max,
-            softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
-        )
+        partitions = getattr(attn_metadata, "partitions", ()) or (attn_metadata,)
+        token_start = 0
+        for partition in partitions:
+            token_end = token_start + partition.num_actual_tokens
+            unified_attention_diffkv(
+                q=query[token_start:token_end],
+                k=key_cache,
+                v=value_cache,
+                out=output[token_start:token_end],
+                cu_seqlens_q=partition.query_start_loc,
+                seqused_k=partition.seq_lens,
+                softmax_scale=self.scale,
+                k_descale=layer._k_scale,
+                v_descale=layer._v_scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+                use_alibi_sqrt=self.use_alibi_sqrt,
+                window_size=self.sliding_window,
+                block_table=partition.block_table,
+                softcap=self.logits_soft_cap,
+                sinks=self.sinks,
+                max_seqlen_q=partition.max_query_len,
+                seq_threshold_3D=partition.seq_threshold_3D,
+                num_par_softmax_segments=partition.num_par_softmax_segments,
+                softmax_segm_output=partition.softmax_segm_output,
+                softmax_segm_max=partition.softmax_segm_max,
+                softmax_segm_expsum=partition.softmax_segm_expsum,
+            )
+            token_start = token_end
         return output
