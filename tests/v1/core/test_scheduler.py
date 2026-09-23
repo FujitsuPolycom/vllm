@@ -2191,6 +2191,53 @@ def _model_output(scheduler, output, sampled):
     )
 
 
+@pytest.mark.parametrize("use_v2", [False, True])
+@pytest.mark.parametrize(
+    "companion", ["single", "new_long", "running_long", "resumed_long"]
+)
+def test_single_output_batch_skips_only_unneeded_drafting(tmp_path, use_v2, companion):
+    """Single-output newcomers must not disable another request's draft work."""
+    (tmp_path / "config.json").write_text(
+        '{"architectures":["OPTForCausalLM"],"model_type":"opt",'
+        '"max_position_embeddings":128}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        device="cpu",
+        max_model_len=128,
+        num_speculative_tokens=3,
+        use_v2_model_runner=use_v2,
+    )
+    (other,) = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        max_tokens=1 if companion == "single" else 8,
+        req_ids=["other"],
+    )
+    scheduler.add_request(other)
+    if companion in ("running_long", "resumed_long"):
+        first = scheduler.schedule()
+        _model_output(scheduler, first, [[42]])
+        if companion == "resumed_long":
+            scheduler.running.remove(other)
+            scheduler._preempt_request(other, timestamp=0.0)
+    (single,) = create_requests(
+        num_requests=1, num_tokens=16, max_tokens=1, req_ids=["single"]
+    )
+    scheduler.add_request(single)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {"other", "single"}
+    assert output.num_scheduled_tokens["single"] == 16
+    assert output.num_spec_tokens_to_schedule == (0 if companion == "single" else 3)
+    # Scheduling already reserved these slots; only the upcoming draft work
+    # changes, not the KV allocation or the model's configured draft capacity.
+    assert scheduler.num_spec_tokens == 3
+    assert scheduler.kv_cache_manager.get_block_ids(single.request_id)[0]
+
+
 def test_spec_decode_padding_first_decode_step():
     """A request taking its first decode step (whole prompt already computed via
     a prefix-cache hit) is padded with placeholder (-1) spec tokens so it enters

@@ -2261,6 +2261,18 @@ class Scheduler(SchedulerInterface):
         elif self.dynamic_sd_lookup is not None and batch_size > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[batch_size]
 
+        if (
+            num_spec_tokens_to_schedule > 0
+            and scheduled_new_reqs
+            and not scheduled_running_reqs
+            and not scheduled_resumed_reqs
+            and all(request.max_tokens <= 1 for request in scheduled_new_reqs)
+        ):
+            # A new single-output request finishes with its first target sample.
+            # Keep the lookahead slots already reserved during admission; only
+            # omit draft work that cannot contribute another useful token.
+            num_spec_tokens_to_schedule = 0
+
         scheduled_encoder_input_stats = None
         if (
             self.log_stats
