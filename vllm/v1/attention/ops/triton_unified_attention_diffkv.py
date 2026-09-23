@@ -459,6 +459,7 @@ def unified_attention_diffkv(
     # Count tokens to keep short multi-token batches within that allocation;
     # exceeding either the threshold or any actual buffer capacity keeps 2D.
     # This does not extend split-KV to every speculative batch size.
+    # Short windows with at least eight requests avoid split/reduction overhead.
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
@@ -470,6 +471,7 @@ def unified_attention_diffkv(
         or q.shape[0] > softmax_segm_max.shape[0]
         or q.shape[0] > softmax_segm_expsum.shape[0]
         or is_batch_invariant
+        or (0 < sliding_window_val <= 128 and num_seqs >= 8)
     )
 
     # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
