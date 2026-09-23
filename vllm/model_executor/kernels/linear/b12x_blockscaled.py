@@ -75,7 +75,6 @@ def regime_unit(
         key=(prefix, *regime_key(workload), out_dtype),
         requests=(request,),
         stage="weights",
-        autotune=not workload.eager_only,
     )
 
 
@@ -228,7 +227,6 @@ class B12xBlockscaledLinear:
             key=self.signature(workload),
             requests=(request,),
             stage="weights",
-            autotune=not workload.eager_only,
         )
 
     def get_workspace_size(self, rows: int) -> int:

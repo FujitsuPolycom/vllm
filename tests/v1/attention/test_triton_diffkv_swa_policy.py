@@ -86,7 +86,9 @@ def assert_dispatch(calls, args, split):
 def test_dispatch_request_and_window_boundaries(launches, requests, window, rows):
     args = inputs(requests, rows, window)
     attention.unified_attention_diffkv(**args)
-    split = rows == 1 and (requests < 8 or window is None or window > 128)
+    # The integrated multi-query dispatcher admits all rows within its 32-row
+    # scratch budget; the small-window request threshold still applies.
+    split = requests * rows <= 32 and (requests < 8 or window is None or window > 128)
     assert_dispatch(launches, args, split)
 
 
