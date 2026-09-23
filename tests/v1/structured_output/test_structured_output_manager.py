@@ -412,3 +412,103 @@ def test_initial_constraint_activation(
         structured_req = request.structured_output_request
         assert structured_req is not None
         assert structured_req.reasoner is None
+
+
+@pytest.mark.parametrize("parser_kwargs", [None, {}])
+def test_completion_without_reasoning_context_enforces_grammar(parser_kwargs):
+    """A server reasoner must not disable constraints for raw completions."""
+    from types import SimpleNamespace
+
+    import torch
+
+    class Grammar:
+        def __init__(self):
+            self.committed = []
+
+        def validate_tokens(self, tokens):
+            return tokens[:1] if tokens and tokens[0] == 11 else []
+
+        def accept_tokens(self, request_id, tokens):
+            if tokens != [11]:
+                return False
+            self.committed.extend(tokens)
+            return True
+
+        def is_terminated(self):
+            return False
+
+        def fill_bitmask(self, bitmask, index):
+            bitmask[index].fill_(0)
+
+    class DefaultThinkingReasoner:
+        def __init__(self, tokenizer, **kwargs):
+            pass
+
+        def is_reasoning_end(self, token_ids):
+            return False
+
+        def is_reasoning_end_streaming(self, input_ids, delta_ids):
+            return False
+
+    manager = StructuredOutputManager.__new__(StructuredOutputManager)
+    manager.enable_in_reasoning = False
+    manager.reasoner_cls = DefaultThinkingReasoner
+    manager.tokenizer = None
+    manager._grammar_bitmask = torch.empty((4, 1), dtype=torch.int32)
+    manager._full_mask = torch.tensor(-1, dtype=torch.int32)
+    manager.fill_bitmask_parallel_threshold = 128
+    manager.vllm_config = SimpleNamespace(
+        num_speculative_tokens=3,
+        model_config=SimpleNamespace(is_diffusion=False),
+    )
+    grammar = Grammar()
+    request = SimpleNamespace(
+        request_id="raw-completion",
+        use_structured_output=True,
+        prompt_token_ids=[7],
+        all_token_ids=[7],
+        structured_output_request=SimpleNamespace(
+            grammar=grammar,
+            reasoning_ended=None,
+            reasoning_parser_kwargs=parser_kwargs,
+            reasoner=None,
+        ),
+    )
+    assert manager.validate_tokens(request, [11, 99]) == [11]
+    bitmask = manager.grammar_bitmask(
+        {request.request_id: request}, [request.request_id], {}
+    )
+    assert bitmask.tolist() == [[0]]
+    request.all_token_ids.append(11)
+    assert manager.accept_tokens(request, [11])
+    assert grammar.committed == [11]
+    assert request.structured_output_request.reasoner is None
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+def test_explicit_chat_reasoning_context_preserves_constraint_phase(thinking):
+    """Chat template context continues to own the initial reasoning phase."""
+    from types import SimpleNamespace
+
+    class Reasoner:
+        def __init__(self, tokenizer, chat_template_kwargs):
+            self.thinking = chat_template_kwargs["enable_thinking"]
+
+        def is_reasoning_end(self, token_ids):
+            return not self.thinking
+
+    manager = StructuredOutputManager.__new__(StructuredOutputManager)
+    manager.enable_in_reasoning = False
+    manager.reasoner_cls = Reasoner
+    manager.tokenizer = None
+    request = SimpleNamespace(
+        prompt_token_ids=[7],
+        structured_output_request=SimpleNamespace(
+            reasoning_ended=None,
+            reasoning_parser_kwargs={
+                "chat_template_kwargs": {"enable_thinking": thinking}
+            },
+            reasoner=None,
+        ),
+    )
+    assert manager._get_constraint_start(request, ()) == int(thinking)

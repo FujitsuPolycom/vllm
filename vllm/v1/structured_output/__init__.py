@@ -240,6 +240,13 @@ class StructuredOutputManager:
         if structured_req.reasoning_ended:
             return 0
 
+        # Raw completions carry no chat-template reasoning context. A server's
+        # default reasoner must not defer their explicit grammar indefinitely.
+        # Chat/Responses callers provide their parser kwargs when reasoning is
+        # active, so their phase transitions still follow the request's parser.
+        if not structured_req.reasoning_parser_kwargs:
+            return 0
+
         reasoner = self._get_reasoner(request)
         if reasoner is None:
             return 0
