@@ -151,6 +151,15 @@ class AttentionBackend(ABC):
         return spec
 
     @classmethod
+    def customize_hybrid_kv_cache_spec(
+        cls,
+        spec: "AttentionSpec",
+        vllm_config: "VllmConfig",
+    ) -> "AttentionSpec":
+        """Adjust the probe used to size attention against recurrent state."""
+        return cls.customize_spec(spec)
+
+    @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         supported_sizes = cls.get_supported_kernel_block_sizes()
         if not supported_sizes:
@@ -478,6 +487,9 @@ class CommonAttentionMetadata:
 
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
+
+    # True only when the selected graph excludes mixed/prefill kernels.
+    uniform_decode_graph: bool = False
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]

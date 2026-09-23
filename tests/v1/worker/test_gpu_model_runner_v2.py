@@ -22,6 +22,57 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+@pytest.mark.parametrize("recovery", [False, True])
+@pytest.mark.parametrize("logits_only", [False, True])
+def test_boundary_capture_uses_recovered_accepted_state(
+    monkeypatch, recovery, logits_only
+):
+    """Trim before export; logits-only restores reuse their existing checkpoint."""
+    events = []
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.is_last_pp_rank = False
+    runner.cache_config = SimpleNamespace(use_kda_recoverssm=recovery)
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([19])),
+        last_sampled_tokens=None,
+        all_token_ids=SimpleNamespace(gpu=None),
+        total_len=SimpleNamespace(gpu=None),
+    )
+    sampled = torch.tensor([4])
+
+    def update(*args):
+        # A restored prompt can terminate after sampling its first token.
+        sampled.fill_(1 if logits_only else 2)
+        events.append("trim")
+
+    def commit(*args):
+        assert not logits_only
+        assert sampled.item() == 2
+        events.append("commit")
+
+    def capture(*args, accepted_state_committed=False):
+        assert accepted_state_committed is recovery
+        events.append("capture")
+
+    monkeypatch.setattr(model_runner_module, "post_update", update)
+    runner.model_state = SimpleNamespace(postprocess_state=commit)
+    runner.boundary_checkpoint_state = SimpleNamespace(capture_mamba=capture)
+    runner.postprocess_sampled(
+        torch.tensor([0]),
+        torch.tensor([[1, 2, 3, 4]]),
+        sampled,
+        torch.tensor([0]),
+        boundary_capture=None if logits_only else torch.empty(3, 1, 3),
+        logits_only=logits_only,
+    )
+    if logits_only:
+        assert events == ["trim"]
+    else:
+        assert events == (
+            ["trim", "commit", "capture"] if recovery else ["trim", "capture", "commit"]
+        )
+
+
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144
@@ -396,10 +447,10 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
     assert input_batch.positions.item() == 3
 
 
-@pytest.mark.parametrize("dummy_run_fails", [False, True])
+@pytest.mark.parametrize("failure_stage", [None, "init", "prepare", "forward"])
 def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
-    dummy_run_fails: bool,
+    failure_stage: str | None,
 ):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.model_config = SimpleNamespace(
@@ -410,10 +461,21 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     runner.max_num_tokens = 4096
     events: list[object] = []
 
+    def initialize(_, *, num_blocks):
+        assert num_blocks == 1
+        events.append("init-kv")
+        if failure_stage == "init":
+            raise RuntimeError("expected DCP profile failure")
+
+    def prepare():
+        events.append("prepare")
+        if failure_stage == "prepare":
+            raise RuntimeError("expected DCP profile failure")
+
     monkeypatch.setattr(
         model_runner_module,
         "_init_minimal_kv_cache_for_profiling",
-        lambda _: events.append("init-kv"),
+        initialize,
     )
     monkeypatch.setattr(
         model_runner_module,
@@ -423,21 +485,29 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
 
     def dummy_run(*args, **kwargs):
         events.append(("dummy-run", args, kwargs))
-        if dummy_run_fails:
+        if failure_stage == "forward":
             raise RuntimeError("expected DCP profile failure")
         return torch.empty(1), torch.empty(1)
 
     runner._dummy_run = dummy_run
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
 
-    if dummy_run_fails:
+    if failure_stage is not None:
         with pytest.raises(RuntimeError, match="expected DCP profile failure"):
-            runner.profile_glm_dcp_attention()
+            runner.profile_glm_dcp_attention(prepare)
     else:
-        runner.profile_glm_dcp_attention()
+        runner.profile_glm_dcp_attention(prepare)
 
     assert events[0] == "init-kv"
-    assert events[1] == (
+    assert events[-1] == "cleanup"
+    if failure_stage == "init":
+        assert events == ["init-kv", "cleanup"]
+        return
+    assert events[1] == "prepare"
+    if failure_stage == "prepare":
+        assert events == ["init-kv", "prepare", "cleanup"]
+        return
+    assert events[2] == (
         "dummy-run",
         (4096,),
         {
@@ -448,8 +518,7 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
             "profile_all_kv_cache_groups": True,
         },
     )
-    assert events[-1] == "cleanup"
-    if not dummy_run_fails:
+    if failure_stage is None:
         assert events[-2] == "sync"
 
 

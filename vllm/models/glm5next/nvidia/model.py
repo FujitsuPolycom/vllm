@@ -67,6 +67,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     SupportsEagle3,
+    SupportsReplaySSM,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -77,7 +78,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
-from vllm.model_executor.weight_transfer import allocate_weights, materialize_weight
+from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
@@ -106,7 +107,7 @@ from .mhc_prefill_sharding import (
 from .mhc_prefill_sharding import (
     maybe_create as maybe_create_mhc_prefill_ownership,
 )
-from .pooled_indexer import Glm5NextPooledIndexer
+from .pooled_indexer import Glm5NextIndexerScratch, Glm5NextPooledIndexer
 
 logger = init_logger(__name__)
 
@@ -247,9 +248,7 @@ class Glm5NextMoE(nn.Module):
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                allocate_weights(
-                    torch.empty, config.n_routed_experts, dtype=torch.float32
-                )
+                torch.empty(config.n_routed_experts, dtype=torch.float32)
             )
         else:
             self.gate.e_score_correction_bias = None
@@ -359,6 +358,7 @@ class Glm5NextDecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         pool_topk_indices_buffer: torch.Tensor | None = None,
         is_mtp_layer: bool = False,
+        indexer_scratch: Glm5NextIndexerScratch | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -415,6 +415,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 pool_topk_indices_buffer=pool_topk_indices_buffer,
                 skip_rope=getattr(config, "mla_nope", False),
                 is_mtp_layer=is_mtp_layer,
+                indexer_scratch=indexer_scratch,
             )
 
         # MTP layers sit past the base model's hidden layers (layer_idx >=
@@ -481,26 +482,18 @@ class Glm5NextDecoderLayer(nn.Module):
 
             # attn hc
             self.hc_attn_fn = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, d_model, dtype=torch.float32)
+                torch.empty(mix_hc, d_model, dtype=torch.float32)
             )
             self.hc_attn_fn_broadcast: torch.Tensor | None = None
-            self.hc_attn_base = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, dtype=torch.float32)
-            )
-            self.hc_attn_scale = nn.Parameter(
-                allocate_weights(torch.empty, 3, dtype=torch.float32)
-            )
+            self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+            self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
             # ffn hc
             self.hc_ffn_fn = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, d_model, dtype=torch.float32)
+                torch.empty(mix_hc, d_model, dtype=torch.float32)
             )
-            self.hc_ffn_base = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, dtype=torch.float32)
-            )
-            self.hc_ffn_scale = nn.Parameter(
-                allocate_weights(torch.empty, 3, dtype=torch.float32)
-            )
+            self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+            self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
             self.mhc_pre_op = MHCPreOp()
             self.mhc_post_op = MHCPostOp()
@@ -1019,10 +1012,16 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 dtype=torch.int32,
                 device=self.device,
             )
+            indexer_scratch = Glm5NextIndexerScratch(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.scheduler_config.max_num_seqs,
+                torch.device(self.device),
+            )
         else:
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
             pool_topk_indices_buffer = None
+            indexer_scratch = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1042,6 +1041,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
                 pool_topk_indices_buffer=pool_topk_indices_buffer,
+                indexer_scratch=indexer_scratch,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -1384,7 +1384,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, MixtureOfExperts, IsHybrid, SupportsEagle3
+    nn.Module,
+    HasInnerState,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsEagle3,
+    SupportsReplaySSM,
 ):
     packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
     supports_pp: ClassVar[Literal[False]] = False
@@ -1442,15 +1447,30 @@ class Glm5NextForCausalLM(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.kda_state_dtype(
-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = MambaStateDtypeCalculator.kda_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
+        if vllm_config.cache_config.use_kda_recoverssm:
+            dtypes = MambaStateDtypeCalculator.append_kda_recoverssm_record(
+                dtypes, vllm_config.model_config.dtype
+            )
+        return dtypes
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> (
+        tuple[tuple[int, int], tuple[int, int, int]]
+        | tuple[
+            tuple[int, int],
+            tuple[int, int, int],
+            tuple[int, int, int],
+            tuple[int, int, int],
+        ]
+    ):
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_config
         tp_size = parallel_config.tensor_parallel_size
@@ -1459,13 +1479,22 @@ class Glm5NextForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.kda_state_shape(
+        shapes = MambaStateShapeCalculator.kda_state_shape(
             tp_size,
             hf_config.linear_num_heads,
             hf_config.linear_head_dim,
             conv_kernel_size=hf_config.linear_conv_kernel_dim,
             num_spec=num_spec,
         )
+        if vllm_config.cache_config.use_kda_recoverssm:
+            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+                shapes,
+                hf_config.linear_num_heads,
+                hf_config.linear_head_dim,
+                tp_world_size=tp_size,
+                spec_query_len=1 + num_spec,
+            )
+        return shapes
 
     @classmethod
     def get_mamba_state_copy_func(
@@ -1500,7 +1529,11 @@ class Glm5NextForCausalLM(
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3
+    Glm4vForConditionalGeneration,
+    HasInnerState,
+    IsHybrid,
+    SupportsEagle3,
+    SupportsReplaySSM,
 ):
     packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The

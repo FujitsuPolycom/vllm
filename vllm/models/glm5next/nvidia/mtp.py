@@ -23,7 +23,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -49,9 +48,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = allocate_weights(
-            nn.Linear, config.hidden_size * 2, config.hidden_size, bias=False
-        )
+        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
         topk_tokens = config.index_topk
         kpool = getattr(config, "index_kpool", 1) or 1
@@ -335,6 +332,77 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
         """Create a draft-only quantized copy of the shared target head."""
         self.model.prepare_draft_lm_head(source_head)
+
+    def share_target_indexer_storage(self, target: nn.Module) -> bool:
+        """Reuse temporary indexer storage under serial target/MTP execution.
+
+        The V2 loader calls this before profiling or graph capture, without
+        pipeline parallelism or overlapped microbatches. One MTP layer consumes
+        its selections before target execution resumes. KV views, pool tails
+        and model parameters retain independent ownership.
+        """
+        if self.model.num_mtp_layers != 1:
+            return False
+        targets = [
+            module
+            for module in target.modules()
+            if isinstance(module, Glm5NextPooledIndexer)
+        ]
+        drafts = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, Glm5NextPooledIndexer)
+        ]
+        if not targets or len(drafts) != 1:
+            return False
+        source, draft = targets[0], drafts[0]
+        geometry = (
+            "max_tokens",
+            "max_seqs",
+            "max_model_len",
+            "block_size",
+            "dcp_world_size",
+            "dcp_rank",
+            "pool_interleave",
+        )
+        if any(getattr(source, key) != getattr(draft, key) for key in geometry):
+            return False
+        names = ("topk_indices_buffer", "pool_topk_indices_buffer")
+        for module in targets:
+            if module.scratch is not source.scratch or any(
+                getattr(module, name) is not getattr(source, name) for name in names
+            ):
+                return False
+        for name in names:
+            src, dst = getattr(source, name), getattr(draft, name)
+            if (src.shape, src.dtype, src.device) != (dst.shape, dst.dtype, dst.device):
+                return False
+        if any(
+            (src.shape, src.dtype, src.device) != (dst.shape, dst.dtype, dst.device)
+            for (_, src), (_, dst) in zip(
+                source.scratch.named_buffers(),
+                draft.scratch.named_buffers(),
+                strict=True,
+            )
+        ):
+            return False
+
+        replacements = {
+            id(getattr(draft, name)): getattr(source, name) for name in names
+        }
+        # The native indexer holds 512 pool IDs; MLA consumes 2051 token IDs.
+        # Rebind by identity, not by attribute name, including non-Module impls.
+        for module in self.model.modules():
+            for owner in (module, getattr(module, "impl", None)):
+                if owner is None:
+                    continue
+                for name in names:
+                    value = getattr(owner, name, None)
+                    replacement = replacements.get(id(value))
+                    if replacement is not None:
+                        setattr(owner, name, replacement)
+        draft.scratch = source.scratch
+        return True
 
     def forward(
         self,

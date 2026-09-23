@@ -158,6 +158,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
+    supports_kda_state_recovery: bool = False
 
     # Runner-owned stable storage, with NULL_BLOCK_ID in padded request rows.
     mamba_aligned_state_indices: torch.Tensor | None = None
@@ -213,6 +214,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
+        use_kda_state_recovery = (
+            self.supports_kda_state_recovery
+            and vllm_config.cache_config.use_kda_recoverssm
+        )
+        self.state_index_columns = 1 if use_kda_state_recovery else self.num_spec + 1
         self._b12x_mixed = (
             B12xGdnMixedMetadata(
                 max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
@@ -220,7 +226,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 state_columns=self.num_spec + 1,
                 device=device,
             )
-            if self.gdn_prefill_backend == "b12x"
+            if self.gdn_prefill_backend == "b12x" and not use_kda_state_recovery
             else None
         )
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
@@ -238,7 +244,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (self.decode_cudagraph_max_bs, self.state_index_columns),
             dtype=torch.int32,
             device=device,
         )
@@ -279,7 +285,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
         self._decode_state_indices_source: torch.Tensor | None = None
         self._decode_state_indices_view: torch.Tensor | None = None
-        self._reuse_spec_decode_inputs = envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
+        self._reuse_spec_decode_inputs = (
+            envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH and not use_kda_state_recovery
+        )
         # Constant sources for the uniform spec-decode fast path. They are
         # copied into the builder-owned graph buffers above, never handed to
         # the layers directly: a full cudagraph captured from a uniform batch
@@ -453,6 +461,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        if m.uniform_decode_graph and self._can_reuse_spec_inputs(
+            m, num_accepted_tokens, num_decode_draft_tokens_cpu
+        ):
+            assert num_accepted_tokens is not None
+            # Uniform graphs read the packed decode metadata, not the mixed
+            # prefill worklists. Mixed graphs keep their complete staging even
+            # when the request rows happen to be uniform on this invocation.
+            return self._build_uniform_spec_decode(m, num_accepted_tokens)
         mixed = getattr(self, "_b12x_mixed", None)
         if mixed is not None:
             mixed.stage(
@@ -493,7 +509,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
-            spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+            # A speculative row contains exactly one target token followed by
+            # its draft tokens. Profiling may provide a zero-draft marker for
+            # a long prefill, which must not enter the bounded decode kernel.
+            query_lens_cpu = query_start_loc_cpu.diff()
+            spec_sequence_masks_cpu = (
+                (num_decode_draft_tokens_cpu >= 0)
+                & (num_decode_draft_tokens_cpu <= self.num_spec)
+                & (query_lens_cpu == num_decode_draft_tokens_cpu + 1)
+            )
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             # A zero-draft varlen batch still recovers the previous step's
             # accepted recurrent state before consuming its bonus tokens.
@@ -575,7 +599,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 # Filter by spec_sequence_masks to exclude padded sequences
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.state_index_columns
                 ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
@@ -596,7 +620,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.state_index_columns
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0
@@ -995,12 +1019,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         del slot_mapping
         assert metadata.num_reqs > 0
         assert metadata.seq_lens is not None
+        if (
+            metadata.is_uniform_spec_decode
+            and metadata.b12x_mixed is None
+            and self._reuse_spec_decode_inputs
+            and self.mamba_aligned_state_indices is not None
+        ):
+            assert metadata.num_accepted_tokens is not None
+            return self._build_uniform_spec_decode(
+                metadata, metadata.num_accepted_tokens
+            )
         mixed = None
         if metadata.b12x_mixed is not None:
             mixed = self._b12x_mixed
             assert mixed is not None
-            mixed.copy_worklists_from(metadata.b12x_mixed)
-            mixed.refresh_state_indices(
+            mixed.copy_and_refresh_from(
+                metadata.b12x_mixed,
                 self._get_state_indices(
                     blk_table, metadata.seq_lens, metadata.num_reqs
                 ),
@@ -1055,7 +1089,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             non_spec_sequence_masks_cpu = ~spec_sequence_masks_cpu
             spec_state_indices = state_indices[
-                spec_sequence_masks_cpu, : self.num_spec + 1
+                spec_sequence_masks_cpu, : self.state_index_columns
             ]
             non_spec_state_indices = state_indices[non_spec_sequence_masks_cpu, 0]
         prefill_state_indices = metadata.prefill_state_indices

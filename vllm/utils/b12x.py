@@ -42,7 +42,8 @@ class B12xWorkload:
     ``stage`` selects the lifecycle point: ``weights`` runs after model load
     and before memory profiling; ``state`` runs after the KV and state pools
     exist. ``eager_only`` marks multimodal-encoder shapes that are executed
-    eagerly and never captured.
+    eagerly and never captured. ``block_table_widths`` supplies allocated
+    kernel-page table widths by layer name for state preparation.
     """
 
     stage: Literal["weights", "state"]
@@ -55,6 +56,7 @@ class B12xWorkload:
     speculative_tokens: int = 0
     lane: int = 0
     eager_only: bool = False
+    block_table_widths: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self):
         if self.stage not in ("weights", "state"):
@@ -94,6 +96,7 @@ class B12xPreparationUnit:
     requests: tuple[PreparationRequest, ...]
     stage: Literal["weights", "state"]
     autotune: bool = True
+    workspace_lanes: tuple[int, ...] = (0,)
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name:
@@ -103,6 +106,10 @@ class B12xPreparationUnit:
             raise ValueError("invalid native preparation stage")
         if type(self.autotune) is not bool:
             raise TypeError("autotune must be boolean")
+        lanes = tuple(self.workspace_lanes)
+        if not lanes or any(type(lane) is not int or lane < 0 for lane in lanes):
+            raise ValueError("workspace lanes must be nonnegative integers")
+        object.__setattr__(self, "workspace_lanes", tuple(sorted(set(lanes))))
         requests = tuple(self.requests)
         names = [request.name for request in requests]
         if len(names) != len(set(names)):
@@ -210,7 +217,7 @@ def scope_b12x_unit_calls(unit: B12xPreparationUnit, lane: int) -> B12xPreparati
         )
         for request in unit.requests
     )
-    return replace(unit, requests=requests)
+    return replace(unit, requests=requests, workspace_lanes=(lane,))
 
 
 def b12x_preparation_token_counts(

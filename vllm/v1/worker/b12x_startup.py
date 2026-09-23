@@ -14,12 +14,17 @@ import os
 import pickle
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from b12x.preparation import TuningCacheRequirement
+    from b12x.preparation import TuningCacheRequirement, TuningRequirement
 
-_CONTROL_GROUPS: dict[tuple[int, int], object] = {}
+    from vllm.distributed.utils import StatelessProcessGroup
+
+_CONTROL_GROUPS: dict[tuple[int, int], StatelessProcessGroup] = {}
+_TuningResult = tuple[
+    str, tuple[int, ...], dict[str, object] | None, float | None, int | None, int
+]
 
 
 def _scoped_key(key: str, ranks: tuple[int, ...]) -> str:
@@ -42,11 +47,13 @@ class B12xPreparationCoordinator:
         world_group,
         process_local_only: bool = False,
         workspace=None,
+        request_workspace_lanes: dict[str, tuple[int, ...]] | None = None,
     ) -> None:
         if type(global_rank) is not int or global_rank < 0:
             raise ValueError("global_rank must be a nonnegative integer")
         self.session = session
         self._workspace = workspace
+        self._request_workspace_lanes = request_workspace_lanes
         self._active_requests = ()
         self.global_rank = global_rank
         self.world_group = world_group
@@ -62,7 +69,7 @@ class B12xPreparationCoordinator:
             from b12x.preparation._timing import PreparationTiming
 
             self._timing = PreparationTiming("coordinator", rank=global_rank)
-        self._last_advance_end = None
+        self._last_advance_end: float | None = None
         self._round = 0
         self._control = None
         if not process_local_only and len(self.world_ranks) > 1:
@@ -73,7 +80,7 @@ class B12xPreparationCoordinator:
 
             self._control = dist.PrefixStore(f"stage-{sequence}", group.store)
         self._authorized_key: str | None = None
-        self._authorized_tuning = None
+        self._authorized_tuning: tuple[TuningRequirement, ...] | None = None
         self._authorized_cache: tuple[TuningCacheRequirement, ...] | None = None
         self._stop = False
         self._error: dict[str, object] | None = None
@@ -192,9 +199,11 @@ class B12xPreparationCoordinator:
 
                 self._authorized_tuning = tuple(
                     TuningRequirement(
-                        _unscoped_key(key), ranks, assignment, latency, index
+                        _unscoped_key(key), ranks, assignment, latency, index, rejected
                     )
-                    for key, ranks, assignment, latency, index in decision["tuning"]
+                    for key, ranks, assignment, latency, index, rejected in decision[
+                        "tuning"
+                    ]
                     if self.global_rank in ranks
                 )
         self._global_done = decision["done"]
@@ -299,13 +308,25 @@ class B12xPreparationCoordinator:
 
         job.result().close()
         if self._workspace is not None:
+            from vllm.v1.worker.workspace import use_workspace_lane
+
             for request in self._active_requests:
                 specs = tuple(request.plan.scratch_specs())
                 if specs:
-                    self._workspace.get_simultaneous(
-                        *((spec.shape, spec.dtype) for spec in specs)
+                    lanes = (
+                        (0,)
+                        if self._request_workspace_lanes is None
+                        else self._request_workspace_lanes[request.name]
                     )
-            self._workspace.reserve_all()
+                    for lane in lanes:
+                        with use_workspace_lane(lane):
+                            self._workspace.get_simultaneous(
+                                *((spec.shape, spec.dtype) for spec in specs)
+                            )
+            if self._request_workspace_lanes is None:
+                self._workspace.reserve_all()
+            else:
+                self._workspace.reserve_by_lane()
         self._active_requests = ()
         self._job = None
         if self._batches:
@@ -320,7 +341,7 @@ class B12xPreparationCoordinator:
             (item.key, item.ranks) for item in self._last_progress.ready_collectives
         )
 
-    def _ready_tuning(self) -> tuple[tuple[object, ...], ...]:
+    def _ready_tuning(self) -> tuple[_TuningResult, ...]:
         if self._last_progress is None:
             return ()
         return tuple(
@@ -330,6 +351,7 @@ class B12xPreparationCoordinator:
                 None if item.assignment is None else item.assignment.to_dict(),
                 item.latency_us,
                 item.candidate_index,
+                item.rejected_count,
             )
             for item in getattr(self._last_progress, "ready_tuning", ())
         )
@@ -356,7 +378,9 @@ class B12xPreparationCoordinator:
             raise RuntimeError(
                 "preparation control exchange did not include complete world domain"
             )
-        ranks = tuple(sorted(int(entry["global_rank"]) for entry in gathered))
+        ranks = tuple(
+            sorted(int(cast(int, entry["global_rank"])) for entry in gathered)
+        )
         if ranks != self.world_ranks or len(set(ranks)) != len(ranks):
             raise RuntimeError(
                 "preparation control exchange has inconsistent global ranks"
@@ -477,8 +501,9 @@ def _authorize_ready(
     ready_by_key: dict[str, set[int]] = {}
     participants_by_key: dict[str, tuple[int, ...]] = {}
     for entry in gathered:
-        rank = int(entry["global_rank"])
-        for key, ranks in entry["ready"]:
+        rank = int(cast(int, entry["global_rank"]))
+        ready = cast(tuple[tuple[str, tuple[int, ...]], ...], entry["ready"])
+        for key, ranks in ready:
             ranks = tuple(ranks)
             if ranks != tuple(sorted(set(ranks))) or not set(ranks) <= set(world_ranks):
                 raise RuntimeError(
@@ -525,14 +550,14 @@ def _authorize_caches(gathered, world_ranks):
 def _authorize_tuning(
     gathered: list[dict[str, object]], world_ranks: tuple[int, ...]
 ) -> tuple[tuple[object, ...], ...]:
-    contributions: dict[str, list[tuple[float, int, int, object]]] = {}
+    contributions: dict[str, list[tuple[float, int, int, dict[str, object]]]] = {}
     ready_by_key: dict[str, set[int]] = {}
     participants_by_key: dict[str, tuple[int, ...]] = {}
+    rejected_by_key: dict[str, int] = {}
     for entry in gathered:
-        rank = int(entry["global_rank"])
-        for key, ranks, assignment, latency_us, candidate_index in entry.get(
-            "tuning", ()
-        ):
+        rank = int(cast(int, entry["global_rank"]))
+        tuning = cast(tuple[_TuningResult, ...], entry.get("tuning", ()))
+        for key, ranks, assignment, latency_us, candidate_index, rejected in tuning:
             ranks = tuple(ranks)
             if (
                 ranks != tuple(sorted(set(ranks)))
@@ -546,23 +571,38 @@ def _authorize_tuning(
                     "preparation tuning participants disagree for one key"
                 )
             ready_by_key.setdefault(key, set()).add(rank)
+            rejected_by_key[key] = rejected_by_key.get(key, 0) + rejected
             if assignment is not None:
+                assert latency_us is not None and candidate_index is not None
                 contributions.setdefault(key, []).append(
                     (float(latency_us), int(candidate_index), rank, assignment)
                 )
     choices = [
         key
         for key, ranks in participants_by_key.items()
-        if ready_by_key.get(key) == set(ranks) and contributions.get(key)
+        if ready_by_key.get(key) == set(ranks)
     ]
     winners = []
     for key in sorted(choices):
+        if not contributions.get(key):
+            raise RuntimeError(
+                f"no launchable candidates for preparation tuning {key}: "
+                f"{rejected_by_key[key]} candidates rejected across ranks "
+                f"{participants_by_key[key]}"
+            )
         candidates = contributions[key]
         indices = [candidate[1] for candidate in candidates]
         if len(indices) != len(set(indices)):
             raise RuntimeError("preparation tuning shards overlap")
         latency_us, candidate_index, _, assignment = min(candidates)
         winners.append(
-            (key, participants_by_key[key], assignment, latency_us, candidate_index)
+            (
+                key,
+                participants_by_key[key],
+                assignment,
+                latency_us,
+                candidate_index,
+                rejected_by_key[key],
+            )
         )
     return tuple(winners)

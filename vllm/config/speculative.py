@@ -4,6 +4,7 @@
 import copy
 import functools
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -385,6 +386,8 @@ class SpeculativeConfig:
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
+    model_subfolder: str | None = None
+    """Relative directory containing the draft config and weights inside model."""
     method: SpeculativeMethod | None = None
     """The name of the speculative method to use. If users provide and set the
     `model` param, the speculative method type will be detected automatically
@@ -627,7 +630,7 @@ class SpeculativeConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        factors: list[Any] = []
+        factors: list[Any] = [self.method, self.num_speculative_tokens]
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = self.method in (
@@ -1088,8 +1091,35 @@ class SpeculativeConfig:
         target_hf_overrides: Callable[[PretrainedConfig], PretrainedConfig],
         hf_config: PretrainedConfig,
     ) -> PretrainedConfig:
+        """Apply the draft normalization before a target config transform."""
         hf_config = SpeculativeConfig.hf_config_override(hf_config)
         return target_hf_overrides(hf_config)
+
+    @staticmethod
+    def _apply_mtp_dict_hf_override(
+        target_hf_overrides: dict[str, Any],
+        hf_config: PretrainedConfig,
+        *,
+        require_mtp: bool = False,
+    ) -> PretrainedConfig:
+        """Apply target patches without replacing the MTP discriminator."""
+        hf_config = SpeculativeConfig.hf_config_override(hf_config)
+        if require_mtp and hf_config.model_type not in get_args(MTPModelTypes):
+            return hf_config
+        for key, value in target_hf_overrides.items():
+            if key in {"architectures", "model_type"}:
+                continue
+            target = getattr(hf_config, key, None)
+            if isinstance(value, dict) and target is not None:
+                if isinstance(target, dict):
+                    target.update(value)
+                    continue
+                if hasattr(target, "__dict__"):
+                    for nested_key, nested_value in value.items():
+                        setattr(target, nested_key, nested_value)
+                    continue
+            setattr(hf_config, key, value)
+        return hf_config
 
     @staticmethod
     def compose_draft_hf_overrides(
@@ -1118,6 +1148,27 @@ class SpeculativeConfig:
         )
 
     @staticmethod
+    def get_draft_hf_overrides(
+        method: str,
+        target_hf_overrides: HfOverrides | None,
+    ) -> HfOverrides:
+        """Return overrides appropriate for the selected draft method."""
+        if method == "medusa":
+            return {"model_type": "medusa"}
+        if method == "mtp" and isinstance(target_hf_overrides, dict):
+            return functools.partial(
+                SpeculativeConfig._apply_mtp_dict_hf_override,
+                target_hf_overrides,
+            )
+        if method == "draft_model" and isinstance(target_hf_overrides, dict):
+            return functools.partial(
+                SpeculativeConfig._apply_mtp_dict_hf_override,
+                target_hf_overrides,
+                require_mtp=True,
+            )
+        return SpeculativeConfig.compose_draft_hf_overrides(target_hf_overrides)
+
+    @staticmethod
     def _is_custom_proposer_path(model: str | None) -> bool:
         """True if ``model`` is a dotted import path (e.g. ``pkg.MyProposer``)."""
         if model is None:
@@ -1130,6 +1181,7 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        """Validate speculative settings and construct the draft configuration."""
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -1313,22 +1365,42 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                draft_model = self.model
+                if self.model_subfolder is not None:
+                    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+                    from vllm.transformers_utils.repo_utils import hf_api
+
+                    subfolder = Path(self.model_subfolder)
+                    if (
+                        not subfolder.parts
+                        or subfolder.is_absolute()
+                        or ".." in subfolder.parts
+                    ):
+                        raise ValueError("model_subfolder must be a relative directory")
+                    root = Path(self.model)
+                    if not root.is_dir():
+                        root = Path(
+                            hf_api().snapshot_download(
+                                repo_id=self.model,
+                                revision=self.revision,
+                                allow_patterns=f"{subfolder.as_posix()}/*",
+                                local_files_only=HF_HUB_OFFLINE,
+                            )
+                        )
+                    draft_model = str(root / subfolder)
+                    if not (Path(draft_model) / "config.json").is_file():
+                        raise ValueError(f"Draft config not found in {draft_model}")
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
                 # detect them. When the method is explicitly "medusa", inject
                 # model_type so MedusaConfig.from_pretrained is used instead.
                 draft_hf_overrides: HfOverrides
-                if self.method == "medusa":
-                    draft_hf_overrides = {"model_type": "medusa"}
-                else:
-                    # Compose any callable hf_overrides set on the target so the
-                    # draft config receives the same transform (e.g. the test
-                    # shrink). Dict overrides stay target-only.
-                    draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
-                        self.target_model_config.hf_overrides
-                    )
+                draft_hf_overrides = SpeculativeConfig.get_draft_hf_overrides(
+                    self.method, self.target_model_config.hf_overrides
+                )
                 self.draft_model_config = ModelConfig(
-                    model=self.model,
+                    model=draft_model,
                     runner="draft",
                     tokenizer=(
                         self.model
@@ -1351,6 +1423,9 @@ class SpeculativeConfig:
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
+                    enable_cumem_allocator=(
+                        self.target_model_config.enable_cumem_allocator
+                    ),
                 )
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)

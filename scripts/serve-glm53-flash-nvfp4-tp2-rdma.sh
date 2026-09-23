@@ -13,9 +13,9 @@ CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
 HEAD_IP="${HEAD_IP:-192.168.42.223}"
 WORKER_IP="${WORKER_IP:-192.168.42.110}"
 ETH_IF="${ETH_IF:-enP7s7}"
-IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1}"
-HEAD_IB_IF="${HEAD_IB_IF:-rocep1s0f1,roceP2p1s0f1}"
-WORKER_IB_IF="${WORKER_IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+HEAD_IB_IF="${HEAD_IB_IF:-${IB_IF}}"
+WORKER_IB_IF="${WORKER_IB_IF:-${IB_IF}}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
 MASTER_PORT="${MASTER_PORT:-29653}"
 SPECULATOR="${SPECULATOR:-mtp}"
@@ -50,7 +50,7 @@ VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE="${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE:-512}"
 VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE="${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE:-512}"
 case "${SPECULATOR}" in
   dflash2) default_num_speculative_tokens=7 ;;
-  *) default_num_speculative_tokens=5 ;;
+  *) default_num_speculative_tokens=3 ;;
 esac
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-${default_num_speculative_tokens}}"
 MTP_MOE_BACKEND="${MTP_MOE_BACKEND:-b12x}"
@@ -101,8 +101,8 @@ Usage: $0 [launcher options] [-- vLLM options]
 
 Launch GLM-5.3-Flash with MTP or DFlash2 and TP=2 across tachyon and luxon.
 The Spark cluster launcher starts one native vLLM rank per node, uses the
-management LAN for bootstrap, and combines the two RoCE rails on their direct
-ConnectX-7 link. ALLREDUCE=rocenante (default) routes supported TP collectives
+management LAN for bootstrap, and combines the two RoCE rails on their switched
+ConnectX-7 fabric. ALLREDUCE=rocenante (default) routes supported TP collectives
 through b12x one-shot RoCE; ALLREDUCE=nccl keeps the existing NCCL path. No
 external scheduler is used.
 
@@ -127,6 +127,7 @@ Launcher options:
                 Write uncompressed trace files.
   -h, --help    Show this help.
 
+MTP defaults to three draft tokens; NUM_SPECULATIVE_TOKENS overrides the depth.
 Set SPECULATOR=dflash2 to use the external DFlash2 draft with seven draft
 tokens. DFLASH2_MODEL_PATH selects its local checkpoint.
 
@@ -585,8 +586,9 @@ cluster_args=(
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "NCCL_NET_PLUGIN=none"
   --env "NCCL_IB_GID_INDEX=3"
+  --env "NCCL_IB_TC=${NCCL_IB_TC:-106}"
+  --env "B12X_ROCE_TRAFFIC_CLASS=${B12X_ROCE_TRAFFIC_CLASS:-${NCCL_IB_TC:-106}}"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
-  --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
 )
 
 allreduce_args=()

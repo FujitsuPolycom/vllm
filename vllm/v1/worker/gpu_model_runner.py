@@ -782,7 +782,7 @@ class GPUModelRunner(
                 is_pooling_model=self.is_pooling_model,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
-                use_replayssm=self.cache_config.use_replayssm,
+                use_replayssm=bool(self.cache_config.use_replayssm),
             )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -6645,7 +6645,9 @@ class GPUModelRunner(
             self._cleanup_profiling_kv_cache()
 
     @torch.inference_mode()
-    def profile_glm_dcp_attention(self) -> None:
+    def profile_glm_dcp_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         """Profile GLM split-cache DCP attention before KV cache sizing.
 
         The generic activation profile omits attention metadata and spreads the
@@ -6660,11 +6662,12 @@ class GPUModelRunner(
         ):
             return
 
-        with set_current_vllm_config(self.vllm_config):
-            self._init_minimal_kv_cache_for_profiling()
-
         model_output: tuple[torch.Tensor, torch.Tensor] | None = None
         try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling(num_blocks=1)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
             model_output = self._dummy_run(
                 self.max_num_tokens,
                 force_attention=True,
@@ -7474,7 +7477,7 @@ class GPUModelRunner(
                     is_pooling_model=self.is_pooling_model,
                     cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                     reasoning_config=self.vllm_config.reasoning_config,
-                    use_replayssm=self.cache_config.use_replayssm,
+                    use_replayssm=bool(self.cache_config.use_replayssm),
                     slot_mapping_modes=slot_mapping_modes,
                 )
 
@@ -7590,7 +7593,7 @@ class GPUModelRunner(
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
-            use_replayssm=self.vllm_config.cache_config.use_replayssm,
+            use_replayssm=bool(self.vllm_config.cache_config.use_replayssm),
         )
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention

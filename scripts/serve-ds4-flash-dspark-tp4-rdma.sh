@@ -5,7 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ROOT="${VLLM_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 B12X_ROOT="${B12X_ROOT:-/home/luke/projects/b12x}"
-B12X_COMPILE_CACHE_DIR="${B12X_COMPILE_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/b12x/compile/vllm-tp4}"
+TP_SIZE="${TP_SIZE:-4}"
+B12X_COMPILE_CACHE_DIR="${B12X_COMPILE_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/b12x/compile/vllm-tp${TP_SIZE}}"
 NCCL_ROOT="${NCCL_ROOT:-/home/luke/projects/nccl-2.30.7}"
 NCCL_LIB="${NCCL_LIB:-${NCCL_ROOT}/build/lib/libnccl.so.2.30.7}"
 SPARK_ROOT="${SPARK_ROOT:-/home/luke/projects/spark-vllm-docker}"
@@ -14,14 +15,22 @@ HEAD_IP="${HEAD_IP:-192.168.42.223}"
 LUXON_IP="${LUXON_IP:-192.168.42.110}"
 GRAVITON_IP="${GRAVITON_IP:-192.168.42.55}"
 CHRONITON_IP="${CHRONITON_IP:-192.168.42.78}"
-WORKER_IPS=("${LUXON_IP}" "${GRAVITON_IP}" "${CHRONITON_IP}")
-NODE_IPS="${HEAD_IP},${LUXON_IP},${GRAVITON_IP},${CHRONITON_IP}"
+WORKER_IPS=("${LUXON_IP}" "${GRAVITON_IP}")
+case "${TP_SIZE}" in
+  3) ;;
+  4) WORKER_IPS+=("${CHRONITON_IP}") ;;
+  *) echo "TP_SIZE must be 3 or 4; got '${TP_SIZE}'" >&2; exit 2 ;;
+esac
+NODE_IPS="${HEAD_IP}$(printf ',%s' "${WORKER_IPS[@]}")"
 ETH_IF="${ETH_IF:-enP7s7}"
-IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1}"
-NCCL_IB_HCA="${NCCL_IB_HCA:-=rocep1s0f0:1:0:0,roceP2p1s0f0:1:0:1,rocep1s0f1:1:1:0,roceP2p1s0f1:1:1:1}"
+IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+NCCL_IB_HCA="${NCCL_IB_HCA:-${IB_IF}}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
+ALLREDUCE="${ALLREDUCE:-rocenante}"
+ROCE_ALLREDUCE_MAX_SIZE="${ROCE_ALLREDUCE_MAX_SIZE:-2MB}"
+ROCE_ALLGATHER_MAX_SIZE="${ROCE_ALLGATHER_MAX_SIZE:-16MB}"
 MASTER_PORT="${MASTER_PORT:-29656}"
-CONTAINER_NAME="${CONTAINER_NAME:-vllm_ds4_flash_dspark_tp4}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm_ds4_flash_dspark_tp${TP_SIZE}}"
 IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712:latest}"
 CONTAINER_MEMORY_GB="${CONTAINER_MEMORY_GB:-108}"
 CONTAINER_MEMORY_SWAP_GB="${CONTAINER_MEMORY_SWAP_GB:-112}"
@@ -32,6 +41,8 @@ MODEL_ID="${MODEL_ID:-deepseek-ai/DeepSeek-V4-Flash-0731}"
 MODEL_REVISION="${MODEL_REVISION:-9e165c30e2704aec5d9d593cce3eebd58bbef1cb}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-DeepSeek-V4-Flash}"
 TOKENIZER_MODE="${TOKENIZER_MODE:-deepseek_v4}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-deepseek_v4}"
+REASONING_PARSER="${REASONING_PARSER:-deepseek_v4}"
 ENGRAM_CONFIG="${ENGRAM_CONFIG:-}"
 LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-}"
 SECCOMP_PROFILE="${SECCOMP_PROFILE:-}"
@@ -59,18 +70,21 @@ Usage: $0 [launcher options] [-- vLLM options]
 
 Launch DeepSeek-V4-Flash with DSpark speculative decoding and TP=4 across
 tachyon, luxon, graviton, and chroniton through the Spark cluster launcher.
+TP_SIZE=3 uses tachyon, luxon, and graviton for models supporting TP3.
 The launcher runs one native vLLM rank per node, uses the management LAN for
-bootstrap, and uses NCCL across both physical links of the ConnectX-7 ring.
+bootstrap, and uses both RoCE interfaces through the ConnectX-7 switch.
+ALLREDUCE=rocenante (default) uses b12x collectives; ALLREDUCE=nccl uses NCCL.
 
 Launcher options:
   --sync-code   Mirror local vllm/ and b12x/ runtime packages to all workers.
-  --check       Validate all four nodes and Spark networking without launching.
+  --check       Validate the selected nodes and Spark networking without launching.
   --detach      Run the head rank in the background; use docker logs to follow it.
   --no-spec     Plain decode: no DSpark drafter (same as NUM_SPECULATIVE_TOKENS=0).
   --spec N      DSpark with N speculative tokens (same as NUM_SPECULATIVE_TOKENS=N).
   -h, --help    Show this help.
 
-Environment overrides include HEAD_IP, LUXON_IP, GRAVITON_IP, CHRONITON_IP,
+Environment overrides include TP_SIZE, ALLREDUCE, ROCE_ALLREDUCE_MAX_SIZE,
+ROCE_ALLGATHER_MAX_SIZE, HEAD_IP, LUXON_IP, GRAVITON_IP, CHRONITON_IP,
 MODEL_ID, MODEL_REVISION, HF_CACHE, MAX_MODEL_LEN, MAX_NUM_SEQS,
 NUM_SPECULATIVE_TOKENS, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION,
 B12X_ROOT, B12X_COMPILE_CACHE_DIR, NCCL_ROOT, IMAGE_NAME, CONTAINER_MEMORY_GB,
@@ -104,6 +118,14 @@ while (($#)); do
       ;;
   esac
 done
+
+case "${ALLREDUCE}" in
+  rocenante|nccl) ;;
+  *)
+    echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
+    exit 2
+    ;;
+esac
 
 case "${NCCL_DEBUG}" in
   VERSION|WARN|INFO|TRACE) ;;
@@ -302,10 +324,6 @@ cluster_args=(
   --name "${CONTAINER_NAME}"
   --eth-if "${ETH_IF}"
   --ib-if "${IB_IF}"
-  --node-ib-if "${HEAD_IP}=${IB_IF}"
-  --node-ib-if "${LUXON_IP}=${IB_IF}"
-  --node-ib-if "${GRAVITON_IP}=${IB_IF}"
-  --node-ib-if "${CHRONITON_IP}=${IB_IF}"
   --master-port "${MASTER_PORT}"
   --nccl-debug "${NCCL_DEBUG}"
   --no-ray
@@ -344,35 +362,46 @@ cluster_args=(
   --env "VLLM_USE_B12X_MOE=1"
   --env "VLLM_USE_B12X_SPARSE_INDEXER=1"
   --env "B12X_MLA_SM120_UNIFIED=1"
-  --env "B12X_DENSE_SPLITK_TURBO=1"
+  --env "B12X_DENSE_SPLITK_TURBO=${B12X_DENSE_SPLITK_TURBO:-1}"
   --env "B12X_W4A16_TC_DECODE=1"
   --env "B12X_MOE_FORCE_A8=1"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
-  --env "VLLM_ENABLE_ROCE_ALLREDUCE=0"
   --env "NCCL_NET_PLUGIN=none"
   --env "LD_PRELOAD=${NCCL_LIB}"
   --env "VLLM_NCCL_SO_PATH=${NCCL_LIB}"
-  --env "NCCL_SKIP_TREE_CONNECT=1"
-  --env "NCCL_FORCE_RANK_ORDER_RING=1"
   --env "NCCL_NET=IB"
   --env "NCCL_IB_DISABLE=0"
   --env "NCCL_IB_HCA=${NCCL_IB_HCA}"
   --env "NCCL_IB_GID_INDEX=3"
+  --env "NCCL_IB_TC=${NCCL_IB_TC:-106}"
+  --env "B12X_ROCE_TRAFFIC_CLASS=${B12X_ROCE_TRAFFIC_CLASS:-${NCCL_IB_TC:-106}}"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
-  --env "NCCL_NET_MERGE_POLICY=RAIL"
+  --env "NCCL_NET_MERGE_POLICY=ALL"
   --env "NCCL_NET_MERGE_LEVEL=SYS"
-  --env "NCCL_IB_SUBNET_PREFIX_LEN=30"
-  --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
-  --env "NCCL_ALGO=Ring"
-  --env "NCCL_PROTO=LL,LL128,Simple"
-  --env "NCCL_MIN_NCHANNELS=4"
-  --env "NCCL_MAX_NCHANNELS=4"
-  --env "NCCL_CROSS_NIC=1"
   --env "NCCL_CUMEM_ENABLE=0"
   --env "NCCL_RUNTIME_CONNECT=1"
   --env "NCCL_P2P_LEVEL=SYS"
   --env "NCCL_IGNORE_CPU_AFFINITY=1"
 )
+for node_ip in "${HEAD_IP}" "${WORKER_IPS[@]}"; do
+  cluster_args+=(--node-ib-if "${node_ip}=${IB_IF}")
+done
+if [[ -n "${NCCL_MAX_NCHANNELS:-}" ]]; then
+  cluster_args+=(--env "NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS}")
+fi
+
+allreduce_args=()
+if [[ "${ALLREDUCE}" == rocenante ]]; then
+  cluster_args+=(
+    --env "VLLM_ENABLE_ROCE_ALLREDUCE=1"
+    --env "VLLM_ROCE_ALLREDUCE_MAX_SIZE=${ROCE_ALLREDUCE_MAX_SIZE}"
+    --env "VLLM_ROCE_ALLGATHER_MAX_SIZE=${ROCE_ALLGATHER_MAX_SIZE}"
+    --env "B12X_ROCE_CACHE_DIR=${B12X_COMPILE_CACHE_DIR}/roce"
+  )
+else
+  cluster_args+=(--env "VLLM_ENABLE_ROCE_ALLREDUCE=0")
+  allreduce_args+=(--disable-custom-all-reduce)
+fi
 
 if ((check_only)); then
   exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" --check-config
@@ -397,7 +426,7 @@ compilation_config=$(printf \
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
   speculative_config="$(
-    "${PYTHON_BIN}" - "${NUM_SPECULATIVE_TOKENS}" \
+    "${PYTHON_BIN}" - "${NUM_SPECULATIVE_TOKENS}" "${TP_SIZE}" \
       "${DSPARK_DRAFT_ATTENTION_BACKEND}" "${DRAFT_SAMPLE_METHOD}" \
       "${DSPARK_ADAPTIVE_VERIFICATION}" \
       "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}" <<'PY'
@@ -405,7 +434,7 @@ import json
 import math
 import sys
 
-tokens, attention, sampling, adaptive, scale = sys.argv[1:]
+tokens, tp_size, attention, sampling, adaptive, scale = sys.argv[1:]
 if sampling not in {"greedy", "probabilistic"}:
     raise SystemExit("DRAFT_SAMPLE_METHOD must be greedy or probabilistic")
 booleans = {"1": True, "true": True, "yes": True, "on": True,
@@ -422,7 +451,7 @@ if not math.isfinite(scale) or scale <= 0 or (not adaptive and scale != 1):
 config = {
     "method": "dspark",
     "num_speculative_tokens": int(tokens),
-    "draft_tensor_parallel_size": 4,
+    "draft_tensor_parallel_size": int(tp_size),
     "draft_sample_method": sampling,
     "rejection_sample_method": "standard",
     "enable_adaptive_verification": adaptive,
@@ -443,9 +472,9 @@ vllm_command=(
   --host 0.0.0.0
   --port "${PORT}"
   --trust-remote-code
-  --tensor-parallel-size 4
+  --tensor-parallel-size "${TP_SIZE}"
   --decode-context-parallel-size 1
-  --disable-custom-all-reduce
+  "${allreduce_args[@]}"
   --kv-cache-dtype fp8
   --block-size 256
   --load-format b12x
@@ -465,11 +494,11 @@ vllm_command=(
   --enable-flashinfer-autotune
   --compilation-config "${compilation_config}"
   --tokenizer-mode "${TOKENIZER_MODE}"
-  --tool-call-parser deepseek_v4
+  --tool-call-parser "${TOOL_CALL_PARSER}"
   --enable-auto-tool-choice
-  --reasoning-parser deepseek_v4
+  --reasoning-parser "${REASONING_PARSER}"
   --reasoning-config
-  '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
+  "{\"reasoning_parser\":\"${REASONING_PARSER}\",\"reasoning_start_str\":\"\",\"reasoning_end_str\":\"\"}"
   --default-chat-template-kwargs.thinking=true
   --default-chat-template-kwargs.reasoning_effort=high
 )
@@ -488,8 +517,8 @@ else
   spec_summary="plain decode, no drafter"
 fi
 cat <<BANNER
-Launching ${SERVED_MODEL_NAME} TP=4 on ${NODE_IPS}
-  all-reduce:      NCCL over the four-node RoCE ring
+Launching ${SERVED_MODEL_NAME} TP=${TP_SIZE} on ${NODE_IPS}
+  all-reduce:      ${ALLREDUCE} over the switched RoCE fabric
   speculation:     ${spec_summary}
   max seqs:        ${MAX_NUM_SEQS} (cudagraph capture up to ${max_cudagraph_capture_size})
   context / KV:    ${MAX_MODEL_LEN} tokens, ${KV_CACHE_MEMORY_BYTES} bytes

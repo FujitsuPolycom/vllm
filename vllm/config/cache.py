@@ -165,7 +165,8 @@ class CacheConfig:
     Applies only to sliding-window and Mamba cache groups."""
     recurrent_checkpoint_policy: RecurrentCheckpointPolicy = "auto"
     """Retention policy for reusable recurrent state. ``request_boundaries``
-    retains a verified leading chat-instruction prefix, the completed prompt,
+    retains a verified leading chat-instruction prefix, one prefill checkpoint
+    before the final chunk of a long prompt, the completed prompt,
     and the committed response endpoint, disabling arbitrary intermediate
     checkpoints. ``aligned`` preserves block-aligned retention. ``auto`` selects
     request boundaries for supported configurations and aligned retention
@@ -213,15 +214,20 @@ class CacheConfig:
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+1. Kimi-K3 speculative decode does not use B.
     Default 16."""
-    use_replayssm: bool = False
-    """Use the ReplaySSM Mamba2 decode kernel: cache recent SSM inputs and skip
+    use_replayssm: bool | None = None
+    """Enable checkpoint recovery. None selects B12X recovery automatically for
+    supported GLM-5.3 speculative decoding, including atomic request-boundary
+    external caching. False (--no-use-replayssm) retains full speculative states.
+    Other models remain opt-in.
+
+    For Mamba2, use the ReplaySSM decode kernel: cache recent SSM inputs and skip
     the per-step full-state store, writing the checkpoint back only on flush.
     Requires mamba_cache_mode 'none' or 'align' (prefix caching) and the Triton
     or FlashInfer mamba backend; standard (non-speculative) decode only. In align
     mode flushes are most efficient when mamba_block_size is a multiple of
     replayssm_buffer_len, but this is not required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
-    """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    """Whether Kimi-K3 or GLM-5.3 KDA uses speculative state recovery."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

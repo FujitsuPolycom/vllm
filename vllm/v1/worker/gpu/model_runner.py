@@ -78,6 +78,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -201,6 +202,7 @@ logger = init_logger(__name__)
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self.cudagraph_native_memory_profile: tuple[int, int, int] | None = None
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -472,6 +474,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
+            # Seeded and processed-logprob requests use native filtering even
+            # when unseeded warmup requests select FlashInfer sampling.
+            with self.jit_warmup_registry.activate():
+                register_top_k_top_p_warmups()
             sampler_kwargs: dict[str, Any] = {
                 "max_num_reqs": self.max_num_reqs,
                 "vocab_size": self.vocab_size,
@@ -726,7 +732,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
-            use_replayssm=self.cache_config.use_replayssm,
+            use_replayssm=bool(self.cache_config.use_replayssm),
         )
         piecewise_capture_available = bool(
             envs.VLLM_USE_BREAKABLE_CUDAGRAPH or has_compiled_submodule(self.model)
@@ -1004,15 +1010,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner.dummy_pooler_run(hidden_states)
 
     def _reserve_profile_scratch(self) -> None:
-        seen: set[int] = set()
+        model_lanes: dict[int, set[int]] = {}
+        for model, lane in (
+            (self.get_model(), 0),
+            (self.get_draft_model(), self._draft_workspace_lane),
+        ):
+            if model is not None:
+                for module in model.modules():
+                    model_lanes.setdefault(id(module), set()).add(lane)
+        seen: set[tuple[int, int]] = set()
         for module in self.compilation_config.static_forward_context.values():
-            if id(module) in seen:
-                continue
-            seen.add(id(module))
-            reserve = getattr(module, "reserve_profile_scratch", None)
-            if reserve is not None:
-                reserve()
-        current_workspace_manager().reserve_all()
+            for lane in sorted(model_lanes.get(id(module), {0})):
+                key = (id(module), lane)
+                if key in seen:
+                    continue
+                seen.add(key)
+                reserve = getattr(module, "reserve_profile_scratch", None)
+                if reserve is not None:
+                    with use_workspace_lane(lane):
+                        reserve()
+        current_workspace_manager().reserve_by_lane()
 
     @torch.inference_mode()
     def profile_run(
@@ -1054,7 +1071,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         self._profile_deepseek_v4_attention(prepare_profile_state)
-        current_workspace_manager().reserve_all()
+        current_workspace_manager().reserve_by_lane()
         self.reset_encoder_cache()
         gc.collect()
 
@@ -1094,15 +1111,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _teardown_profiling_state(self)
 
     @torch.inference_mode()
-    def profile_glm_dcp_attention(self) -> None:
+    def profile_glm_dcp_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         """Measure the GLM DCP query-gather peak before KV cache sizing.
 
         The general activation profile deliberately skips attention and splits
         its token budget across many requests. A GLM sparse-MLA prefill can put
         the complete scheduler budget in one request, causing the DCP query
         all-gather to require substantially more temporary memory. Bind a
-        minimal split cache, execute that shape, then release all temporary
-        cache and backend state before production cache allocation.
+        one-block split cache for that single request, prepare its bound kernel
+        plans, then release the temporary cache before production allocation.
         """
         if (
             self.model_config.architecture != "Glm5NextForConditionalGeneration"
@@ -1110,8 +1129,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             return
 
-        _init_minimal_kv_cache_for_profiling(self)
         try:
+            _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
             self._dummy_run(
                 self.max_num_tokens,
                 context_len=self.dcp_size * self.cp_interleave,
@@ -1204,13 +1225,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
                     if self.adaptive_verification is not None:
-                        with self.step_timing.collect() as timings:
-                            for batch in self.adaptive_verification.batches_to_profile(
-                                self.cudagraph_manager.captured_token_counts(),
-                                self.cudagraph_manager.captured_full_batch_shapes(),
-                            ):
-                                self._dummy_run(**batch)
-                        self.adaptive_verification.set_initial_cost_curves(timings)
+                        self.adaptive_verification.profile_costs(
+                            self._dummy_run,
+                            self.step_timing,
+                            self.cudagraph_manager.captured_token_counts(),
+                            self.cudagraph_manager.captured_full_batch_shapes(),
+                        )
                     self.kv_connector.reset_capture_state()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1625,6 +1645,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
             fast_prefill=fast_prefill,
+            uniform_decode_graph=(
+                batch_desc.cg_mode == CUDAGraphMode.FULL
+                and batch_desc.uniform_token_count is not None
+            ),
             max_query_len=(
                 int(num_scheduled_tokens_upper_bound.max())
                 if adaptive_verification is not None
@@ -1788,7 +1812,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             boundary_capture,
         )
 
-        if boundary_capture is not None:
+        # Full-checkpoint kernels retain every speculative state, so capture
+        # selects an accepted column before postprocessing compacts it. Recovery
+        # kernels only materialize the accepted state during postprocessing.
+        recover_state = self.cache_config.use_kda_recoverssm
+        if boundary_capture is not None and not recover_state:
             assert self.boundary_checkpoint_state is not None
             self.boundary_checkpoint_state.capture_mamba(idx_mapping, boundary_capture)
 
@@ -1798,6 +1826,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
+        if boundary_capture is not None and recover_state:
+            assert self.boundary_checkpoint_state is not None
+            self.boundary_checkpoint_state.capture_mamba(
+                idx_mapping, boundary_capture, accepted_state_committed=True
+            )
 
     def _merge_ec_connector_no_forward(
         self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput
