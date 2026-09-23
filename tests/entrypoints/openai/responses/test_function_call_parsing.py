@@ -10,6 +10,82 @@ from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessa
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 
+@pytest.mark.parametrize("input_kind", [list, tuple])
+def test_additional_tools_are_request_configuration(input_kind):
+    """Promote tools before named-tool validation and preserve their order."""
+
+    def tool(name):
+        return {
+            "type": "function",
+            "name": name,
+            "description": name,
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+    request = ResponsesRequest(
+        model="qwen",
+        tools=[tool("first")],
+        tool_choice={"type": "function", "name": "second"},
+        input=input_kind(
+            [
+                {
+                    "id": "at_1",
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [tool("second")],
+                },
+                {"role": "user", "content": "Call the second tool"},
+            ]
+        ),
+    )
+    assert [entry.name for entry in request.tools] == ["first", "second"]
+    assert len(request.input) == 1
+    assert request.input[0]["role"] == "user"
+    assert request.tool_choice.name == "second"
+
+
+def test_additional_tools_support_typed_items():
+    """Typed SDK objects and dict envelopes share the same validation path."""
+    from openai.types.responses.response_item import AdditionalTools
+
+    request = ResponsesRequest(
+        model="qwen",
+        tool_choice="required",
+        input=[
+            AdditionalTools(
+                id="at_1",
+                type="additional_tools",
+                role="developer",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "exec",
+                        "description": "execute",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            ),
+            {"role": "user", "content": "Run pwd"},
+        ],
+    )
+    assert [entry.name for entry in request.tools] == ["exec"]
+    assert len(request.input) == 1
+    assert request.tool_choice == "required"
+
+
+@pytest.mark.parametrize("tools", [None, "invalid", [{"type": "unknown"}]])
+def test_invalid_additional_tools_are_left_for_input_validation(tools):
+    item = {
+        "id": "at_1",
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": tools,
+    }
+    result = ResponsesRequest.check_tool_usage({"model": "qwen", "input": [item]})
+    assert result["input"] == [item]
+    assert not result.get("tools")
+
+
 def test_function_call_dict_converted_to_object():
     """Test that function_call dictionaries are correctly parsed into
     ResponseFunctionToolCall objects."""
