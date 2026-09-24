@@ -243,9 +243,7 @@ def test_b12x_indexer_prefill_chunks_match_declared_capacity(
     builder = object.__new__(generic_b12x_indexer.B12xIndexerMetadataBuilder)
     builder.max_prefill_buffer_size = 10_000
     builder.vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=max_num_batched_tokens
-        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens),
         model_config=SimpleNamespace(max_model_len=250),
     )
 
@@ -1821,6 +1819,7 @@ def test_mla_layer_discovers_backend_and_optional_query_plans(
     layer = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(layer)
     layer.impl = Backend()
+    layer.prefill_backend = None
     set_b12x_preparation_provider(layer.impl, layer.impl)
     set_b12x_preparation_provider(layer, layer)
     if query_projection:
@@ -1844,7 +1843,8 @@ def test_mla_layer_discovers_backend_and_optional_query_plans(
         max_model_len=64,
     )
     units = tuple(_units_from_modules(layer, workload))
-    assert units[0] is unit
+    # Discovery attaches workspace lanes by value; the prepared request is retained.
+    assert units[0] == unit
     assert len(units) == (2 if query_projection else 1)
     if query_projection:
         assert units[1].name == "MLA_QUERY"
@@ -2570,7 +2570,8 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
     allocated = torch.accelerator.memory_allocated(device)
     units = tuple(_units_from_modules(layer, workload))
     assert torch.accelerator.memory_allocated(device) == allocated
-    assert len(units) == 1 and len(units[0].requests) == len(counts) + 1
+    # Three exact decode plans plus one shared capacity plan cover this workload.
+    assert len(units) == 1 and len(units[0].requests) == len(counts)
     source = torch.randn(
         capacity + 1,
         max(32, layer.n_local_heads),
@@ -2595,7 +2596,10 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
                 get_b12x_scratch_buffers(plan)
             session.freeze()
             current_workspace_manager().lock()
-            declared = (dict(layer._b12x_wo_resolver.exact_plans), dict(layer._b12x_wo_resolver.capacity_plans))
+            declared = (
+                dict(layer._b12x_wo_resolver.exact_plans),
+                dict(layer._b12x_wo_resolver.capacity_plans),
+            )
             for rows in (*counts, 3, 20, 32):
                 plan = layer._b12x_wo_plan(rows)
                 assert plan.prepared is not None
@@ -2644,7 +2648,10 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
                     )
                 finally:
                     graph.reset()
-            assert (layer._b12x_wo_resolver.exact_plans, layer._b12x_wo_resolver.capacity_plans) == declared
+            assert (
+                layer._b12x_wo_resolver.exact_plans,
+                layer._b12x_wo_resolver.capacity_plans,
+            ) == declared
             with pytest.raises(RuntimeError, match="no prepared b12x plan covers"):
                 layer._o_proj(source, positions)
     finally:
@@ -3087,7 +3094,7 @@ def test_deepseek_v4_mla_preparation_restores_cache_and_replays(
 @pytest.mark.parametrize("autotune", [False, True])
 @torch.no_grad()
 def test_deepseek_v4_indexer_prepares_replicated_heads_and_live_cache(
-    mode, autotune, tmp_path
+    mode, autotune, tmp_path, default_vllm_config
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x DSA indexing requires SM12x")

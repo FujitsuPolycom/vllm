@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.deepseek_v4_1 import l2_prefetch
 from vllm.models.deepseek_v4_1.b12x_layers import (
     B12xFP8LinearMethod,
     B12xLinearMethod,
@@ -547,6 +548,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     set_weight_attrs(param, {"allow_tp_padding": True})
         self._wo_projection_weights = None
         self._wo_resolver = B12xPlanResolver("V4.1 WO projection")
+        self._l2pf_wo = None
+        self._l2pf_ffn = None
         for linear in (self.fused_wqa_wkv, self.wq_b):
             _native_linear(linear)
         self.rotary_emb = build_deepseek_v4_rope(
@@ -726,7 +729,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     output_mode="provided",
                 ),
             )
-            metadata_specs = (
+            metadata_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] = (
                 ((capacity, self.swa_width), torch.int32),
                 ((capacity,), torch.int32),
                 ((capacity,), torch.int32),
@@ -767,7 +770,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self._owns_topk_indices = (
                 self.topk_indices_buffer is None and self.is_index_source
             )
-        specs = []
+        specs: list[tuple[str, tuple[int, ...], torch.dtype]] = []
         if self._owns_topk_indices:
             specs.append(("topk_indices_buffer", (self.capacity, 512), torch.int32))
         if self.indexer is not None:
@@ -865,7 +868,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self._short_index_shape is not None:
                 regimes.append(("prefill_short", *self._short_index_shape))
             for mode, chunk, width in regimes:
-                counts = set()
+                counts: set[int] = set()
                 counts.update(min(rows, chunk) for rows in token_counts)
                 counts.update(rows % chunk for rows in token_counts if rows % chunk)
                 for rows in sorted(counts):
@@ -1044,6 +1047,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             from b12x.attention.dsa_indexer.mxfp4 import score_mxfp4, select_mxfp4
             from b12x.preparation import PreparedCall
 
+            assert self.indexer is not None
             cache = self.indexer.k_cache.kv_cache
             device, heads = cache.device, self.indexer.heads
             width = state.caps.max_page_table_width
@@ -1164,6 +1168,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             raise ValueError(
                 f"V4.1 {mode} indexer rows {rows} exceed chunk capacity {chunk}"
             )
+        assert self.indexer is not None
         return dsa_indexer.plan(
             dsa_indexer.Caps(
                 device=self.rotary_emb.cos_sin_cache.device,
@@ -1315,6 +1320,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
         qr, kv = self.q_norm(qr), self.kv_norm(kv)
         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+        l2_prefetch.issue(self._l2pf_wo, rows)
         q = _rotated(
             q,
             positions,
@@ -1480,50 +1486,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
+        metadata_specs = self._attention_workspace_specs[mode]
         buffers = current_workspace_manager().get_simultaneous(
-            *self._attention_workspace_specs[mode],
+            *metadata_specs,
             *((spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()),
         )
-        swa_indices, swa_lengths, top_lengths = buffers[:3]
-        visible = main.cache_lengths if main is not None else swa.cache_lengths
-        _chunk[(rows,)](
-            swa.positions,
-            swa.req_id_per_token,
-            swa.block_table,
-            swa_indices,
-            swa_lengths,
-            top_lengths,
-            visible,
-            swa.query_start_loc,
-            swa.request_positions,
-            0,
-            swa.block_table.stride(0),
-            self.swa_cache_layer.block_size,
-            self.window_size,
-            self.swa_width,
-            self.is_draft,
-            triton.next_power_of_2(self.swa_width),
-            swa_replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
-        )
-        kwargs = {}
-        metadata_count = 3
-        if main is not None:
-            main_pages = buffers[3]
-            metadata_count += 1
-            _pages[(rows, triton.cdiv(self._main_width, 128))](
-                main.req_id_per_token,
-                main.block_table,
-                main_pages,
-                0,
-                main.block_table.stride(0),
-                main.block_table.shape[1],
-                self._main_width,
-                128,
+        metadata_count = len(metadata_specs)
+        # Decode layers sharing cache groups map identical pages, so the first
+        # layer of each group keeps its metadata for the rest of the forward.
+        if mode == "decode":
+            key = (
+                id(swa),
+                id(main),
+                self.is_draft,
+                self.is_ced_decoder,
+                rows,
+                metadata_specs,
             )
+            context = get_forward_context()
+            shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
+            entry = shared.get(key)
+            if entry is None or entry[0] is not swa or entry[1] is not main:
+                metadata_buffers = tuple(
+                    torch.empty(shape, dtype=dtype, device=q.device)
+                    for shape, dtype in metadata_specs
+                )
+                retain_cuda_graph_capture_resource(metadata_buffers)
+                self._write_decode_metadata(metadata_buffers, swa, main, rows)
+                entry = shared[key] = (swa, main, metadata_buffers)
+            buffers = [*entry[2], *buffers[metadata_count:]]
+        else:
+            self._write_decode_metadata(buffers, swa, main, rows)
+        swa_indices, swa_lengths, top_lengths = buffers[:3]
+        kwargs = {}
+        if main is not None:
             kwargs = dict(
                 indexed_indices=owner.topk_indices_buffer[:rows],
                 indexed_lengths=top_lengths[:rows],
-                indexed_page_table=main_pages[:rows],
+                indexed_page_table=buffers[3][:rows],
             )
         binding = mla.bind(
             plan,
@@ -1546,6 +1546,40 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             out=output,
             cache_format="deepseek_v41",
         )
+
+    def _write_decode_metadata(self, buffers, swa, main, rows):
+        swa_indices, swa_lengths, top_lengths = buffers[:3]
+        visible = main.cache_lengths if main is not None else swa.cache_lengths
+        _chunk[(rows,)](
+            swa.positions,
+            swa.req_id_per_token,
+            swa.block_table,
+            swa_indices,
+            swa_lengths,
+            top_lengths,
+            visible,
+            swa.query_start_loc,
+            swa.request_positions,
+            0,
+            swa.block_table.stride(0),
+            self.swa_cache_layer.block_size,
+            self.window_size,
+            self.swa_width,
+            self.is_draft,
+            triton.next_power_of_2(self.swa_width),
+            swa_replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
+        )
+        if main is not None:
+            _pages[(rows, triton.cdiv(self._main_width, 128))](
+                main.req_id_per_token,
+                main.block_table,
+                buffers[3],
+                0,
+                main.block_table.stride(0),
+                main.block_table.shape[1],
+                self._main_width,
+                128,
+            )
 
     def setup_wo_projection(self):
         groups = self.n_local_groups
@@ -1639,13 +1673,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             capacity=lambda rows: self._declare_wo_plan(rows, is_prefill=True),
         )
         requests = [
-            self._wo_resolver.resolve(rows).request(
-                name=f"{self.prefix}.wo.m{rows}", prepare_call=prepare, benchmark_call=prepare,
-            ) for rows in token_counts
+            self._wo_plan(rows).request(
+                name=f"{self.prefix}.wo.m{rows}",
+                prepare_call=prepare,
+                benchmark_call=prepare,
+            )
+            for rows in token_counts
         ]
-        requests.append(self._wo_resolver.capacity_plans[self.capacity].request(
-            name=f"{self.prefix}.wo.prefill", prepare_call=prepare, benchmark_call=prepare,
-        ))
+        requests.append(
+            self._wo_plan(self.capacity, is_prefill=True).request(
+                name=f"{self.prefix}.wo.prefill",
+                prepare_call=prepare,
+                benchmark_call=prepare,
+            )
+        )
         return B12xPreparationUnit(
             name="V41WOProjection",
             key=(self.prefix, token_counts),
@@ -1659,25 +1700,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             raise PreparationResourceUnavailableError("V4.1 WO weights are not packed")
         table = self.rotary_emb.cos_sin_cache
         return wo_projection.plan(
-                wo_projection.Caps(
-                    device=table.device, max_tokens=rows, groups=weights.groups,
-                    group_width=weights.group_width, rank=weights.rank, hidden=weights.hidden,
-                ),
-                invocation=dict(
-                    operation="inv_rope",
-                    dynamic_tokens=is_prefill,
-                    heads_per_group=self.n_local_heads // self.n_local_groups,
-                    nope_dim=self.head_dim - self.rope_head_dim,
-                    rope_dim=self.rope_head_dim,
-                    positions_dtype="int64",
-                    cos_sin_dtype=str(table.dtype).removeprefix("torch."),
-                ),
-            )
+            wo_projection.Caps(
+                device=table.device,
+                max_tokens=rows,
+                groups=weights.groups,
+                group_width=weights.group_width,
+                rank=weights.rank,
+                hidden=weights.hidden,
+            ),
+            invocation=dict(
+                operation="inv_rope",
+                dynamic_tokens=is_prefill,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.head_dim - self.rope_head_dim,
+                rope_dim=self.rope_head_dim,
+                positions_dtype="int64",
+                cos_sin_dtype=str(table.dtype).removeprefix("torch."),
+            ),
+        )
 
-    def _wo_plan(self, rows: int, *, is_prefill: bool = False):
+    def _wo_plan(self, rows: int, *, is_prefill: bool = False) -> wo_projection.Plan:
         if is_prefill and rows <= self.capacity:
-            return self._wo_resolver.capacity_plans[self.capacity]
-        return self._wo_resolver.resolve(rows)
+            return cast(
+                wo_projection.Plan, self._wo_resolver.capacity_plans[self.capacity]
+            )
+        return cast(wo_projection.Plan, self._wo_resolver.resolve(rows))
 
     def _o_proj(self, o, positions, *, is_prefill=False):
         from b12x.preparation import require_prepared
@@ -1691,6 +1738,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         require_prepared(plan, "gemm.wo_projection", o.device)
         weights = self._wo_projection_weights
+        assert weights is not None
         scratch = _scratch(plan)
         binding = wo_projection.bind_inv_rope(
             plan,
@@ -1721,6 +1769,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         if local.dtype != torch.bfloat16:
             raise TypeError("V4.1 WO projection must return BF16")
+        l2_prefetch.issue(self._l2pf_ffn, rows)
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
         return local

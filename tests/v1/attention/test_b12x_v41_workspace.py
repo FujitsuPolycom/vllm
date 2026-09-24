@@ -6,6 +6,7 @@ import gc
 import weakref
 from functools import partial
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -79,11 +80,15 @@ def test_indexer_loads_complete_projections_on_tp_rank(native_workspace, monkeyp
 
 
 def _layer(attention, layer_id=0, swa_page=32):
+    from vllm.utils.b12x import B12xPlanResolver
+
     # Avoid checkpoint/model construction: exercise the real planning and
     # attention methods with the same TP4 head geometry and serving capacity.
     layer = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
     torch.nn.Module.__init__(layer)
     layer.prefix = f"model.layers.{layer_id}.self_attn"
+    layer._wo_resolver = B12xPlanResolver(layer.prefix + ".wo")
+    layer._l2pf_wo = layer._l2pf_ffn = None
     layer.layer_id = layer_id
     layer.config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=64),
@@ -320,9 +325,9 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
     plan = layer._declare_index_plan("prefill", 256)
     attention._scratch(plan)
     manager.lock()
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated(device)
+    torch.accelerator.reset_peak_memory_stats(device)
     with PreparationSession(device=device, autotune=False) as session:
         session.prepare(
             [
@@ -332,8 +337,8 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
                 )
             ]
         )
-        torch.cuda.synchronize()
-        peak = torch.cuda.max_memory_allocated(device) - before
+        torch.accelerator.synchronize()
+        peak = torch.accelerator.max_memory_allocated(device) - before
         assert peak < 64 * 1024**2
         torch.testing.assert_close(cache, torch.zeros_like(cache), rtol=0, atol=0)
 
@@ -1027,7 +1032,6 @@ def test_output_projection_prepares_uncaptured_decode_sizes(native_workspace):
     layer.wo_a = projection(256, 4096, 1 / 64)
     layer.wo_b = projection(256, 256, 1 / 16)
     layer._wo_projection_weights = None
-    layer._wo_plans = {}
     layer.setup_wo_projection()
     layer._declare_attention(device)
     workload = B12xWorkload(
@@ -1067,7 +1071,7 @@ def test_output_projection_prepares_uncaptured_decode_sizes(native_workspace):
                     output = layer._o_proj(source[:15], positions[:15])
                 source.neg_()
                 graph.replay()
-                torch.cuda.synchronize(device)
+                torch.accelerator.synchronize(device)
                 torch.testing.assert_close(
                     output, torch.full_like(output, -128), rtol=0, atol=0
                 )
@@ -1097,7 +1101,6 @@ def test_output_projection_capture_releases_caller_activations(
     layer.rope_head_dim = 64
     layer.o_lora_rank = 1024
     layer.hidden_size = 5120
-    layer._wo_plans = {}
     angles = torch.randn(32, 32, device=device)
     layer.rotary_emb = SimpleNamespace(
         cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1)
@@ -1130,7 +1133,10 @@ def test_output_projection_capture_releases_caller_activations(
     manager.reserve_all(
         *(
             (spec.shape, spec.dtype)
-            for plan in layer._wo_plans.values()
+            for plan in (
+                *layer._wo_resolver.exact_plans.values(),
+                *layer._wo_resolver.capacity_plans.values(),
+            )
             for spec in plan.scratch_specs()
         )
     )
@@ -1186,8 +1192,10 @@ def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch
 
     import b12x.preparation as preparation
 
+    from vllm.utils.b12x import B12xPlanResolver
+
     attention, _, _ = native_workspace
-    calls = {}
+    calls: dict[str, Any] = {}
     plan = SimpleNamespace(scratch_specs=lambda: (), prepared=object())
 
     @dataclass
@@ -1239,7 +1247,9 @@ def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch
         weight_scale_inv=torch.empty((8, 8), dtype=torch.float8_e8m0fnu, device="cuda"),
     )
     layer._wo_projection_weights = None
-    layer._wo_plans = {3: plan}
+    layer._wo_resolver = B12xPlanResolver("test.wo")
+    layer._wo_resolver.exact_plans = {3: plan}
+    layer._l2pf_wo = layer._l2pf_ffn = None
 
     layer.setup_wo_projection()
     output = layer._o_proj(

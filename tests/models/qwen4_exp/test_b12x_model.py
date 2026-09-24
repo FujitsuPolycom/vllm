@@ -387,6 +387,7 @@ def test_mtp_compaction_preserves_attention_rows_and_selected_outputs(indices):
     nn.Module.__init__(layer)
     layer.ple = None
     layer.layer_type = "full_attention"
+    layer.defer_hc_reductions = False
     rows = {}
 
     def attention(*, hidden_states, positions):

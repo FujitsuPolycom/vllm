@@ -42,6 +42,8 @@ COMPONENT = "gemm.blockscaled_precision"
 
 
 def _operands(packed, recipe: str):
+    if recipe in ("iq2_xs", "iq2_xxs", "q8_0"):
+        return packed.values, packed.metadata, None, "none"
     if recipe == "nvfp4":
         return (
             packed.values,
@@ -88,8 +90,10 @@ class B12xBlockscaledLinear:
         layer_name: str,
         activation_scale: torch.Tensor | None = None,
     ) -> None:
-        if recipe not in ("nvfp4", "mxfp8"):
-            raise ValueError("block-scaled linear recipe must be nvfp4 or mxfp8")
+        if recipe not in ("nvfp4", "mxfp8", "iq2_xs", "iq2_xxs", "q8_0"):
+            raise ValueError(
+                "block-scaled linear recipe must be nvfp4, mxfp8 or iq2_xs"
+            )
         self.packed = packed
         self.recipe = recipe
         self.activation_mode = activation_mode
@@ -276,9 +280,22 @@ class B12xBlockscaledLinear:
                     )
                 workspace = reserved[: state.required_workspace]
             else:
-                (workspace,) = current_workspace_manager().get_simultaneous(
+                manager = current_workspace_manager()
+                (workspace,) = manager.get_simultaneous(
                     ((state.required_workspace,), torch.uint8)
                 )
+                source_end = source.data_ptr() + source.numel() * source.element_size()
+                if (
+                    source.data_ptr() < workspace.data_ptr() + workspace.numel()
+                    and workspace.data_ptr() < source_end
+                ):
+                    # A latent MoE projection consumes an arena-backed output.
+                    # Keep that live prefix intact while borrowing GEMM scratch.
+                    live_bytes = source_end - workspace.data_ptr()
+                    _, workspace = manager.get_simultaneous(
+                        ((live_bytes,), torch.uint8),
+                        ((state.required_workspace,), torch.uint8),
+                    )
         api = get_b12x_blockscaled()
         assert api is not None
         return api.mm(
