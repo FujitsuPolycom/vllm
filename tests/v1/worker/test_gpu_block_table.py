@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
+from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
@@ -378,3 +379,55 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+def test_block_tables_circular_group_maps_positions_into_its_ring():
+    """A circular-buffer group holds one block per request as a ring. With the
+    runner's per-spec settings, every position maps into that block at position
+    modulo the block size; a request without a ring block and padding tokens map
+    to padding, and positional groups are unchanged."""
+    device = torch.device("cuda")
+    specs = (
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+        ),
+        CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1024,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    enabled, circular = zip(*(slot_mapping_mode(spec) for spec in specs))
+    block_tables = BlockTables(
+        block_sizes=[spec.block_size for spec in specs],
+        max_num_reqs=2,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[4, 1],
+        device=device,
+        kernel_block_sizes=[spec.block_size for spec in specs],
+        slot_mapping_enabled=list(enabled),
+        slot_mapping_circular=list(circular),
+    )
+    block_tables.append_block_ids(
+        req_index=0, new_block_ids=([3, 4, 5], [9]), overwrite=True
+    )
+    block_tables.append_block_ids(req_index=1, new_block_ids=([6], []), overwrite=True)
+    block_tables.apply_staged_writes()
+
+    positions = list(range(3, 40)) + [5, 6]
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 37, 39], dtype=torch.int32, device=device)
+    slot_mappings = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        torch.tensor(positions + [0, 0], dtype=torch.int64, device=device),
+        num_tokens_padded=len(positions) + 2,
+    )
+    torch.accelerator.synchronize()
+
+    ring = [9 * 8 + p % 8 for p in positions[:37]]
+    assert slot_mappings[1].tolist() == ring + [-1] * 4
+    paged = [[3, 4, 5][p // 16] * 16 + p % 16 for p in positions[:37]]
+    assert slot_mappings[0].tolist() == paged + [6 * 16 + 5, 6 * 16 + 6, -1, -1]

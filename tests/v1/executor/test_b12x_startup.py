@@ -188,7 +188,7 @@ def test_completed_preparation_reserves_each_request_model_lane(monkeypatch):
         )
         for name, size in (("target", 1024), ("draft", 256))
     )
-    events = []
+    events: list[object] = []
     job = _Job(events, [_progress(done=True)])
     coordinator = B12xPreparationCoordinator(
         _Session(job, events),
@@ -213,11 +213,11 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
     gathered = [
         {
             "global_rank": 0,
-            "tuning": (("query", (0, 1), {"width": 4}, 3.0, 0, 0),),
+            "tuning": (("query", (0, 1), {"width": 4}, 3.0, 0, 0, ("a" * 64,)),),
         },
         {
             "global_rank": 1,
-            "tuning": (("query", (0, 1), {"width": 2}, 1.0, 1, 0),),
+            "tuning": (("query", (0, 1), {"width": 2}, 1.0, 1, 0, ("b" * 64,)),),
         },
     ]
 
@@ -229,6 +229,8 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
             1.0,
             1,
             0,
+            1,
+            ("b" * 64,),
         ),
     )
 
@@ -464,17 +466,33 @@ def test_attention_tuning_rendezvous_ignores_rank_local_device_ordinal(variant):
             {
                 "global_rank": rank,
                 "tuning": (
-                    (key, ranks, {"tile_m": 128, "tile_n": 64}, 10.0 + rank, rank, 0),
+                    (
+                        key,
+                        ranks,
+                        {"tile_m": 128, "tile_n": 64},
+                        10.0 + rank,
+                        rank,
+                        0,
+                        (),
+                    ),
                 ),
             }
         )
     authorized = _authorize_tuning(gathered, ranks)
     assert authorized is not None
-    assert authorized[0][1:] == (ranks, {"tile_m": 128, "tile_n": 64}, 10.0, 0, 0)
+    assert authorized[0][1:] == (
+        ranks,
+        {"tile_m": 128, "tile_n": 64},
+        10.0,
+        0,
+        0,
+        0,
+        (),
+    )
 
 
-def _coordinators(progress_by_rank):
-    store = dist.HashStore()
+def _coordinators(progress_by_rank, store=None):
+    store = dist.HashStore() if store is None else store
     store.set_timeout(timedelta(seconds=5))
     ranks = tuple(range(len(progress_by_rank)))
     coordinators, jobs = [], []
@@ -482,7 +500,7 @@ def _coordinators(progress_by_rank):
         events: list[object] = []
         job = _Job(events, progress)
         jobs.append(job)
-        group = SimpleNamespace(store=store)
+        group = SimpleNamespace(store=store.clone())
         # Prefixes must be shared across rank-local channel instances.
         coordinator = B12xPreparationCoordinator(
             _Session(job, events) if progress else None,
@@ -551,6 +569,153 @@ def test_all_local_winners_consolidate_once_with_empty_world_rank():
         assert all(winner.assignment["width"] == 2 for winner in winners)
     decision = pickle.loads(store.get("stage-0/round-0/decision"))
     assert len(decision["tuning"]) == 2
+
+
+def _artifact_fixture(cache, data=b"compiled winner", *, valid=True):
+    import hashlib
+    import json
+
+    key = hashlib.sha256(data).hexdigest()
+    path = cache.path(key, ".o")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    cache.path(key, ".json").write_text(
+        json.dumps(
+            {
+                "cache_key": key,
+                "object_bytes": len(data),
+                "object_sha256": hashlib.sha256(
+                    data if valid else b"corrupt"
+                ).hexdigest(),
+            }
+        )
+    )
+    return key
+
+
+@pytest.mark.parametrize("cached", (False, True))
+def test_winner_artifacts_arrive_before_installation_without_retuning(
+    tmp_path,
+    cached,
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    from b12x.preparation.artifacts import CuTeArtifactCache
+
+    from vllm.v1.worker import b12x_artifacts
+
+    monkeypatch.setattr(b12x_artifacts, "_CHUNK_BYTES", 128)
+    store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+    caches = [CuTeArtifactCache(tmp_path / str(rank)) for rank in (0, 1)]
+    key = _artifact_fixture(caches[1], b"winner" * 100)
+    reverse_key = _artifact_fixture(caches[0], b"reverse winner" * 100)
+    if cached:
+        _artifact_fixture(caches[0], b"winner" * 100)
+        _artifact_fixture(caches[1], b"reverse winner" * 100)
+    progress = [_tuning_progress(rank, keys=("query", "reverse")) for rank in (0, 1)]
+    progress[1].ready_tuning = (
+        replace(progress[1].ready_tuning[0], cute_programs=(key,)),
+        progress[1].ready_tuning[1],
+    )
+    progress[0].ready_tuning = (
+        progress[0].ready_tuning[0],
+        replace(
+            progress[0].ready_tuning[1], latency_us=0.5, cute_programs=(reverse_key,)
+        ),
+    )
+    coordinators, jobs, _ = _coordinators(
+        [[item, _progress(done=True)] for item in progress] + [[]],
+        store=store,
+    )
+    exchanges = []
+    for rank in (0, 1):
+        exchange = b12x_artifacts.WinnerArtifactExchange(
+            coordinators[rank]._control,
+            rank,
+            (0, 1, 2),
+            cache=caches[rank],
+        )
+        coordinators[rank]._artifacts = exchange
+        exchanges.append(exchange)
+    for rank, needed in enumerate((key, reverse_key)):
+        original = jobs[rank].advance
+
+        def install(rank=rank, needed=needed, original=original, **kwargs):
+            if kwargs.get("tuning"):
+                assert caches[rank].has(needed), "winner missing before installation"
+            return original(**kwargs)
+
+        jobs[rank].advance = install
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            outcomes = list(pool.map(_finish, coordinators))
+        assert all(item["done"] and not item["error"] for item in outcomes)
+        assert exchanges[0].fetched == (0 if cached else 1)
+        assert exchanges[1].fetched == (0 if cached else 1)
+        assert all(job.tunings[1][0].assignment["width"] == 2 for job in jobs[:2])
+        assert all(not exchange._thread.is_alive() for exchange in exchanges)
+        assert not store.check(["stage-0/artifacts/1/0/response"])
+        assert not store.check(["stage-0/artifacts/0/1/response"])
+    finally:
+        for coordinator in coordinators:
+            coordinator.abort()
+
+
+@pytest.mark.parametrize("failure", ("missing", "corrupt", "stalled"))
+def test_winner_transfer_failure_leaves_a_local_compile_miss(tmp_path, failure):
+    from b12x.preparation.artifacts import CuTeArtifactCache
+
+    from vllm.v1.worker.b12x_artifacts import WinnerArtifactExchange
+
+    store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+    caches = [CuTeArtifactCache(tmp_path / str(rank)) for rank in (0, 1)]
+    key = _artifact_fixture(caches[1], valid=failure != "corrupt")
+    receiver = WinnerArtifactExchange(store, 0, (0, 1), cache=caches[0], timeout=0.15)
+    sender = None
+    if failure != "stalled":
+        sender = WinnerArtifactExchange(store, 1, (0, 1), cache=caches[1], timeout=0.15)
+        if failure != "missing":
+            sender.offer((key,))
+    try:
+        started = time.monotonic()
+        receiver.fetch(1, (key,))
+        assert time.monotonic() - started < 1
+        assert not caches[0].has(key)
+        assert not list(caches[0].root.rglob(".peer-*"))
+        if failure == "stalled":
+            assert 1 in receiver._failed_peers
+            receiver.fetch(1, (key,))
+            assert receiver._sequence == 1  # No retry for each remaining winner.
+    finally:
+        receiver.close()
+        if sender is not None:
+            sender.close()
+
+
+def test_transferred_pair_is_verified_before_publication(tmp_path):
+    import fcntl
+    import shutil
+
+    from b12x.preparation.artifacts import CuTeArtifactCache
+
+    sender = CuTeArtifactCache(tmp_path / "sender")
+    receiver = CuTeArtifactCache(tmp_path / "receiver")
+    key = _artifact_fixture(sender)
+    with receiver.stage(key) as stage:
+        for suffix in (".o", ".json"):
+            shutil.copyfile(sender.path(key, suffix), stage / (key + suffix))
+        obj = stage / (key + ".o")
+        original = obj.read_bytes()
+        obj.write_bytes(b"x" * len(original))
+        assert not receiver.publish(key, stage)
+        assert not receiver.has(key)
+        obj.write_bytes(original)
+        with receiver.path(key, ".lock").open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            assert not receiver.publish(key, stage)
+        assert receiver.publish(key, stage)
+        assert receiver.has(key)
 
 
 @pytest.mark.parametrize("all_rejected", (False, True))

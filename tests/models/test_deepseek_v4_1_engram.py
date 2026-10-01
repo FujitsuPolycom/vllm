@@ -488,6 +488,9 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
             req_states.num_computed_tokens.gpu[request] = accepted
             batch.query_start_loc[1:].fill_(live)
             state.prepare_inputs(batch, req_states)
+            # Replay immediately, before reference work can hide a late lookup.
+            graph.replay()
+            immediate = tuple(output.clone() for output in actual)
             # Build expected lookback independently of the serving gather kernel.
             history = torch.full((2, 3), -1, dtype=torch.int32, device="cuda")
             width = min(accepted, 3)
@@ -514,6 +517,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
                 expected = engram(
                     hidden, hashes[:, index], ~image_sentinel_mask(batch.input_ids)
                 )
+                torch.testing.assert_close(immediate[index], expected, rtol=0, atol=0)
                 torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
                 torch.testing.assert_close(
                     actual[index][live:], hidden[live:], rtol=0, atol=0

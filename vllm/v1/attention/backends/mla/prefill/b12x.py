@@ -11,7 +11,7 @@ from vllm.v1.attention.backends.mla.prefill.base import MLADimensions, MLAPrefil
 
 
 class B12xPrefillBackend(MLAPrefillBackend):
-    _prepared_causal_modes = (True, False)
+    _prepared_causal_modes: tuple[bool, ...] = (True, False)
     supported_mla_dimensions = [
         MLADimensions(qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128)
     ]
@@ -61,7 +61,8 @@ class B12xPrefillBackend(MLAPrefillBackend):
         # Plans contain immutable geometry, not request metadata or workspace.
         # Metadata builders share plans but assign their own prefill metadata.
         result = copy.copy(self)
-        result._prefill_metadata = None
+        if hasattr(result, "_prefill_metadata"):
+            del result._prefill_metadata
         return result
 
     def supports_out(self):

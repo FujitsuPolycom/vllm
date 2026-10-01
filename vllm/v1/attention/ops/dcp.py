@@ -1585,7 +1585,7 @@ class MLADCPManager:
         transport = self.b12x_transport
         assert transport is not None
         if partial_output.shape[0] <= transport.max_tokens:
-            # B12X_MLA supplies zero output and -inf LSE for every empty local
+            # B12X supplies zero output and -inf LSE for every empty local
             # shard, including padded queries. Other backends must not opt in
             # without satisfying that contract before the collective.
             return transport.combine(

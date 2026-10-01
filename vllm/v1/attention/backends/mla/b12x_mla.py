@@ -3,7 +3,7 @@
 """Prepared B12X dense MLA with caller-owned DCP collectives and scratch."""
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 
@@ -131,7 +131,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         if self._draft_window and (
             not self.non_causal_multi_token_decode or self.dcp_world_size != 1
         ):
-            raise ValueError("B12X_MLA windows require replicated non-causal draft KV")
+            raise ValueError("B12X windows require replicated non-causal draft KV")
         rows = vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold
         width = triton.cdiv(
             _local_cache_capacity(
@@ -152,9 +152,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             return metadata
         rows = metadata.num_decode_tokens
         if rows > self._flat_lengths.numel():
-            raise ValueError(
-                "B12X_MLA decode rows exceed the configured query capacity"
-            )
+            raise ValueError("B12X decode rows exceed the configured query capacity")
         if (
             rows == metadata.num_decodes
             and decode.block_table.shape[1] <= self._flat_table.shape[1]
@@ -206,7 +204,7 @@ class B12xMLABackend(MLACommonBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "B12X_MLA"
+        return "B12X"
 
     @staticmethod
     def get_impl_cls():
@@ -269,19 +267,26 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             for value in (alibi_slopes, sliding_window, logits_soft_cap)
         ):
             raise NotImplementedError(
-                "B12X_MLA does not support ALiBi, windows or logit caps"
+                "B12X does not support ALiBi, windows or logit caps"
             )
         if attn_type != AttentionType.DECODER or num_kv_heads != 1:
-            raise NotImplementedError(
-                "B12X_MLA requires decoder attention and one KV head"
-            )
+            raise NotImplementedError("B12X requires decoder attention and one KV head")
         from b12x.attention import dense_mla
 
         self._dense_mla = dense_mla
         self._config = get_current_vllm_config()
         self._plans = {}
-        self._capacities = ()
+        self.kv_cache = torch.tensor([])
+        self._capacities: tuple[int, ...] = ()
         set_b12x_preparation_provider(self, self)
+
+    def bind_kv_cache(self, kv_cache):
+        self.kv_cache = kv_cache
+
+    def unbind_kv_cache(self):
+        self.kv_cache = torch.tensor([])
+        self._plans.clear()
+        self._capacities = ()
 
     def _cache_view(self, layer):
         cache = layer.kv_cache
@@ -319,7 +324,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         )
         width = triton.cdiv(capacity, cache.shape[1])
         fp8 = cache.dtype == torch.float8_e4m3fn
-        plans = {}
+        plans: dict[int, Any] = {}
         requests = []
         for rows in self._capacities:
             caps = self._dense_mla.Caps(
@@ -420,6 +425,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         cu = torch.arange(rows + 1, dtype=torch.int32, device=cache.device)
         pages = torch.zeros((rows, 1), dtype=torch.int32, device=cache.device)
         fp8 = cache.dtype == torch.float8_e4m3fn
+        scale = torch.ones(1, dtype=torch.float32, device=cache.device) if fp8 else None
         binding = state.bind(
             scratch=scratch,
             q=q,
@@ -428,21 +434,21 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             page_table=pages,
             cache_seqlens=lengths,
             cu_seqlens_q=cu,
-            q_scale=layer._q_scale if fp8 else None,
-            kv_scale=layer._k_scale if fp8 else None,
+            q_scale=scale,
+            kv_scale=scale,
             sm_scale=self.scale,
         )
         state.prime(binding)
         return PreparedCall(
             run=lambda: state.run(binding),
             output=output,
-            owners=(scratch, q, output, lengths, cu, pages, binding),
+            owners=(scratch, q, output, lengths, cu, pages, scale, binding),
         )
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
         decode = attn_metadata.decode
         if decode is None:
-            raise ValueError("B12X_MLA requires decode metadata")
+            raise ValueError("B12X requires decode metadata")
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
         if not q.is_contiguous():
@@ -451,8 +457,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         capacity = next((size for size in self._capacities if rows <= size), None)
         if capacity is None:
             raise PreparationResourceUnavailableError(
-                f"B12X_MLA query rows {rows} exceed prepared capacities "
-                f"{self._capacities}"
+                f"B12X query rows {rows} exceed prepared capacities {self._capacities}"
             )
         plan = self._plans[capacity]
         table = attn_metadata.flat_block_table
@@ -465,7 +470,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 attn_metadata.flat_query_start_loc,
             )
         if rows != lengths.shape[0]:
-            raise ValueError("B12X_MLA requires one flattened sequence per query")
+            raise ValueError("B12X requires one flattened sequence per query")
         output = torch.empty(
             (rows, q.shape[1], self.kv_lora_rank), dtype=torch.bfloat16, device=q.device
         )

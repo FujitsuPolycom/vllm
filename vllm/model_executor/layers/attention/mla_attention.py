@@ -490,10 +490,15 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
         "fp8_e4m3",
     ):
         return "fp8_ds_mla"
-    if backend_name == "B12X" and kv_cache_dtype in (
-        "auto",
-        "fp8",
-        "fp8_e4m3",
+    if (
+        backend_name == "B12X"
+        and attn_backend.is_sparse()
+        and kv_cache_dtype
+        in (
+            "auto",
+            "fp8",
+            "fp8_e4m3",
+        )
     ):
         return "fp8_ds_mla"
     return kv_cache_dtype
@@ -872,7 +877,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self.impl, "reduce_scatter_dcp_output", None
                 ),
                 use_b12x=(
-                    self.attn_backend.get_name() == "B12X_MLA"
+                    self.attn_backend.get_name() == "B12X"
                     and envs.VLLM_USE_B12X_DCP_A2A
                 ),
             )
@@ -1708,7 +1713,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         provider = getattr(impl, "b12x_preparation_provider", None)
         hook = getattr(provider, "get_b12x_preparation_units", None)
         backend_units = tuple(hook(impl, workload)) if callable(hook) else ()
-        prefill_hook = getattr(self.prefill_backend, "get_b12x_preparation_units", None)
+        prefill_hook = getattr(
+            getattr(self, "prefill_backend", None), "get_b12x_preparation_units", None
+        )
         if callable(prefill_hook):
             backend_units += tuple(prefill_hook(self, workload))
         weight = getattr(self, "W_UK_T", None)

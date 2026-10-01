@@ -1159,12 +1159,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _b12x_gdn_prefill_call(self, state, capacity: int, *, benchmark: bool):
         from b12x.preparation import PreparedCall
 
+        slots = self.kv_cache[1]
         specs = tuple(state.layout.scratch_specs())
         if len(specs) != 1:
             raise RuntimeError("b12x GDN prefill requires one scratch buffer")
         spec = specs[0]
-        device = self.kv_cache[1].device
-        slot = 1 if self.kv_cache[1].shape[0] > 1 else 0
+        device = slots.device
+        slot = 1 if slots.shape[0] > 1 else 0
         staging = self._ensure_b12x_gdn_prefill_staging()
         # Trial and prepare factories own their scratch; the runtime path in
         # B12xGdnPrefill.run draws from the workspace manager instead.
@@ -1200,7 +1201,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             offsets = torch.zeros_like(staging.checkpoint_offsets)
             num_seqs = torch.empty_like(staging.num_seqs)
             num_tokens = torch.empty_like(staging.num_tokens)
-            saved_state = self.kv_cache[1][slot : slot + 1].clone()
+            saved_state = slots[slot : slot + 1].clone()
             owners = (
                 scratch,
                 mixed_qkv,
@@ -1251,7 +1252,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         def reset():
             if saved_state is not None:
-                self.kv_cache[1][slot : slot + 1].copy_(saved_state)
+                slots[slot : slot + 1].copy_(saved_state)
 
         binding = state.bind(
             scratch=scratch,
@@ -1262,7 +1263,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b=b,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
-            recurrent_state=self.kv_cache[1],
+            recurrent_state=slots,
             cu_seqlens=cu_seqlens,
             initial_state_indices=indices,
             final_state_indices=final_indices,

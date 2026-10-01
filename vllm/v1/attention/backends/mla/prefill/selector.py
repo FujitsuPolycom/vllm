@@ -15,6 +15,8 @@ from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla.prefill.base import MLADimensions
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import KVCacheSpecKind
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -134,8 +136,14 @@ def get_mla_prefill_backend(
             ),
         )
 
-    if attention_config.mla_prefill_backend is not None:
-        selected_backend = attention_config.mla_prefill_backend
+    selected_backend = attention_config.mla_prefill_backend
+    if selected_backend is None:
+        attention_backend = attention_config.backend_per_kind.get(
+            KVCacheSpecKind.MLA_ATTENTION.value, attention_config.backend
+        )
+        if attention_backend == AttentionBackendEnum.B12X:
+            selected_backend = MLAPrefillBackendEnum.B12X
+    if selected_backend is not None:
         backend_cls: type[MLAPrefillBackend] | None = None
         try:
             backend_cls = selected_backend.get_class()

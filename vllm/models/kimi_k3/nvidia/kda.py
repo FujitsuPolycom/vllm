@@ -54,6 +54,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     can_reuse_projection_output,
     enable_kimi_projection_tail_padding,
     project_into_consumed_output,
+    projection_checkpoint_dimensions,
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -644,6 +645,34 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         assert self.num_heads % self.tp_size == 0
         self.local_num_heads = divide(self.num_heads, self.tp_size)
         self.projection_size = self.head_dim * self.num_heads
+        original_heads = kda_config.get("original_num_heads", self.num_heads)
+        if original_heads != self.num_heads:
+            original_width = original_heads * self.head_dim
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    **{
+                        name: (0, original_width)
+                        for name in (
+                            "q_proj",
+                            "k_proj",
+                            "v_proj",
+                            "g_proj",
+                            "f_b_proj",
+                            "q_conv1d",
+                            "k_conv1d",
+                            "v_conv1d",
+                        )
+                    },
+                    "b_proj": (0, original_heads),
+                    "o_proj": (1, original_width),
+                }
+            )
+            self._tp_checkpoint_dimensions.update(
+                {
+                    "A_log": (None, original_heads),
+                    "dt_bias": (None, original_width),
+                }
+            )
         self.local_projection_size = divide(self.projection_size, self.tp_size)
         self.conv_size = kda_config["short_conv_kernel_size"]
         assert kda_config.get("use_full_rank_gate", False), (

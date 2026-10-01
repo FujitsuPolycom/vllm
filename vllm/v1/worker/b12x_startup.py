@@ -16,15 +16,25 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
 
+from vllm.logger import init_logger
+
 if TYPE_CHECKING:
     from b12x.preparation import TuningCacheRequirement, TuningRequirement
 
     from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.v1.worker.b12x_artifacts import WinnerArtifactExchange
 
 _CONTROL_GROUPS: dict[tuple[int, int], StatelessProcessGroup] = {}
 _TuningResult = tuple[
-    str, tuple[int, ...], dict[str, object] | None, float | None, int | None, int
+    str,
+    tuple[int, ...],
+    dict[str, object] | None,
+    float | None,
+    int | None,
+    int,
+    tuple[str, ...],
 ]
+logger = init_logger(__name__)
 
 
 def _scoped_key(key: str, ranks: tuple[int, ...]) -> str:
@@ -82,6 +92,8 @@ class B12xPreparationCoordinator:
         self._authorized_key: str | None = None
         self._authorized_tuning: tuple[TuningRequirement, ...] | None = None
         self._authorized_cache: tuple[TuningCacheRequirement, ...] | None = None
+        self._artifacts: WinnerArtifactExchange | None = None
+        self._artifacts_disabled = False
         self._stop = False
         self._error: dict[str, object] | None = None
         self._last_progress = None
@@ -197,13 +209,36 @@ class B12xPreparationCoordinator:
             if self._ready_tuning():
                 from b12x.preparation import TuningRequirement
 
+                for _, ranks, _, _, _, _, source, programs in decision["tuning"]:
+                    if (
+                        programs
+                        and self.global_rank in ranks
+                        and source != self.global_rank
+                        and not self._stop
+                    ):
+                        artifacts = self._artifact_exchange()
+                        if artifacts is not None:
+                            artifacts.fetch(source, programs)
                 self._authorized_tuning = tuple(
                     TuningRequirement(
-                        _unscoped_key(key), ranks, assignment, latency, index, rejected
+                        _unscoped_key(key),
+                        ranks,
+                        assignment,
+                        latency,
+                        index,
+                        rejected,
+                        programs,
                     )
-                    for key, ranks, assignment, latency, index, rejected in decision[
-                        "tuning"
-                    ]
+                    for (
+                        key,
+                        ranks,
+                        assignment,
+                        latency,
+                        index,
+                        rejected,
+                        _,
+                        programs,
+                    ) in decision["tuning"]
                     if self.global_rank in ranks
                 )
         self._global_done = decision["done"]
@@ -352,18 +387,25 @@ class B12xPreparationCoordinator:
                 item.latency_us,
                 item.candidate_index,
                 item.rejected_count,
+                item.cute_programs,
             )
             for item in getattr(self._last_progress, "ready_tuning", ())
         )
 
     def _payload(self) -> dict[str, object]:
+        tuning = self._ready_tuning()
+        programs = {program for item in tuning for program in item[-1]}
+        if programs and not self._stop:
+            artifacts = self._artifact_exchange()
+            if artifacts is not None:
+                artifacts.offer(programs)
         return {
             "round": self._round,
             "global_rank": self.global_rank,
             "world_ranks": self.world_ranks,
             "stop": self._stop,
             "ready": self._ready(),
-            "tuning": self._ready_tuning(),
+            "tuning": tuning,
             "cache": self._ready_cache(),
             "local_done": self._local_done,
             "error": self._error,
@@ -372,6 +414,23 @@ class B12xPreparationCoordinator:
 
     def _ready_cache(self):
         return getattr(self._last_progress, "ready_cache", None)
+
+    def _artifact_exchange(self):
+        if (
+            self._artifacts is None
+            and self._control is not None
+            and not self._artifacts_disabled
+        ):
+            try:
+                from vllm.v1.worker.b12x_artifacts import WinnerArtifactExchange
+
+                self._artifacts = WinnerArtifactExchange(
+                    self._control, self.global_rank, self.world_ranks
+                )
+            except Exception:
+                self._artifacts_disabled = True
+                logger.warning("B12X artifact exchange unavailable", exc_info=True)
+        return self._artifacts
 
     def _validate_domain(self, gathered: list[dict[str, object]]) -> None:
         if len(gathered) != len(self.world_ranks):
@@ -403,6 +462,10 @@ class B12xPreparationCoordinator:
         }
 
     def _safe_close(self) -> None:
+        if self._artifacts is not None:
+            self._artifacts.close()
+            self._artifacts = None
+        self._artifacts_disabled = True
         if self._cleanup_complete:
             return
         primary = None
@@ -550,14 +613,24 @@ def _authorize_caches(gathered, world_ranks):
 def _authorize_tuning(
     gathered: list[dict[str, object]], world_ranks: tuple[int, ...]
 ) -> tuple[tuple[object, ...], ...]:
-    contributions: dict[str, list[tuple[float, int, int, dict[str, object]]]] = {}
+    contributions: dict[
+        str, list[tuple[float, int, int, dict[str, object], tuple[str, ...]]]
+    ] = {}
     ready_by_key: dict[str, set[int]] = {}
     participants_by_key: dict[str, tuple[int, ...]] = {}
     rejected_by_key: dict[str, int] = {}
     for entry in gathered:
         rank = int(cast(int, entry["global_rank"]))
         tuning = cast(tuple[_TuningResult, ...], entry.get("tuning", ()))
-        for key, ranks, assignment, latency_us, candidate_index, rejected in tuning:
+        for (
+            key,
+            ranks,
+            assignment,
+            latency_us,
+            candidate_index,
+            rejected,
+            programs,
+        ) in tuning:
             ranks = tuple(ranks)
             if (
                 ranks != tuple(sorted(set(ranks)))
@@ -575,7 +648,13 @@ def _authorize_tuning(
             if assignment is not None:
                 assert latency_us is not None and candidate_index is not None
                 contributions.setdefault(key, []).append(
-                    (float(latency_us), int(candidate_index), rank, assignment)
+                    (
+                        float(latency_us),
+                        int(candidate_index),
+                        rank,
+                        assignment,
+                        programs,
+                    )
                 )
     choices = [
         key
@@ -594,7 +673,7 @@ def _authorize_tuning(
         indices = [candidate[1] for candidate in candidates]
         if len(indices) != len(set(indices)):
             raise RuntimeError("preparation tuning shards overlap")
-        latency_us, candidate_index, _, assignment = min(candidates)
+        latency_us, candidate_index, source, assignment, programs = min(candidates)
         winners.append(
             (
                 key,
@@ -603,6 +682,8 @@ def _authorize_tuning(
                 latency_us,
                 candidate_index,
                 rejected_by_key[key],
+                source,
+                programs,
             )
         )
     return tuple(winners)

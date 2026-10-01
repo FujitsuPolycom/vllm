@@ -393,3 +393,117 @@ def test_fa4_fused_fp8_output_matches_post_quant(default_vllm_config):
     # ...and most elements land in the exact same fp8 bucket.
     exact = (fused_fp8.view(torch.uint8) == ref_fp8.view(torch.uint8)).float().mean()
     assert exact > 0.9, f"only {exact:.1%} of fused FP8 outputs matched the baseline"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("causal", [True, False])
+@torch.inference_mode()
+def test_b12x_prefill_packed_sequences_and_changed_input_graph(causal, monkeypatch):
+    """Prepared prefill preserves packed boundaries and mutable graph inputs."""
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM12x")
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import PreparationSession
+
+    from vllm.model_executor.layers.attention.mla_attention import (
+        MLACommonMetadataBuilder,
+    )
+    from vllm.v1.attention.backends.mla.prefill.b12x import B12xPrefillBackend
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    manager = workspace.WorkspaceManager(device)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(
+        MLACommonMetadataBuilder,
+        "determine_chunked_prefill_workspace_size",
+        staticmethod(lambda _: 128),
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32, max_num_seqs=2),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    heads, scale = 10, 192**-0.5
+    backend = B12xPrefillBackend(heads, scale, 512, 128, 64, 128, config)
+    units = backend.get_b12x_preparation_units(
+        SimpleNamespace(layer_name="test.mla"), SimpleNamespace(stage="weights")
+    )
+    query_lengths = [3, 6]
+    key_lengths = query_lengths if causal else [65, 8]
+    cu_q = torch.tensor([0, 3, 9], dtype=torch.int32, device=device)
+    cu_k = torch.tensor(
+        [0, key_lengths[0], sum(key_lengths)], dtype=torch.int32, device=device
+    )
+    q = torch.randn(9, heads, 192, device=device, dtype=torch.bfloat16) * 0.1
+    k = (
+        torch.randn(sum(key_lengths), heads, 192, device=device, dtype=torch.bfloat16)
+        * 0.1
+    )
+    # The projection's V view is interleaved with K and must be packed.
+    kv = (
+        torch.randn(sum(key_lengths), heads, 256, device=device, dtype=torch.bfloat16)
+        * 0.1
+    )
+    v = kv[..., 128:]
+    out = torch.empty(9, heads, 128, device=device, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(query_start_loc=cu_q, max_query_len=6)
+    backend.prepare_metadata(metadata)
+    chunk = SimpleNamespace(
+        query_start_loc=cu_q,
+        cu_seq_lens=cu_k,
+        max_query_len=6,
+        max_seq_len=max(key_lengths),
+    )
+
+    def run():
+        if causal:
+            return backend.run_prefill_new_tokens(q, k, v, True, out=out)
+        return backend.run_prefill_context_chunk(chunk, q, k, v, out=out)
+
+    def check(actual, lse):
+        q_start = k_start = 0
+        for nq, nk in zip(query_lengths, key_lengths):
+            logits = (
+                torch.einsum(
+                    "qhd,khd->hqk",
+                    q[q_start : q_start + nq].float(),
+                    k[k_start : k_start + nk].float(),
+                )
+                * scale
+            )
+            if causal:
+                mask = torch.ones(nq, nk, device=device, dtype=torch.bool).triu(1)
+                logits.masked_fill_(mask, float("-inf"))
+            expected = torch.einsum(
+                "hqk,khd->qhd", logits.softmax(-1), v[k_start : k_start + nk].float()
+            )
+            torch.testing.assert_close(
+                actual[q_start : q_start + nq].float(), expected, atol=5e-4, rtol=2e-2
+            )
+            torch.testing.assert_close(
+                lse[:, q_start : q_start + nq],
+                logits.logsumexp(-1),
+                atol=2e-5,
+                rtol=2e-5,
+            )
+            q_start += nq
+            k_start += nk
+
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(tuple(r for unit in units for r in unit.requests))
+        check(*run())
+        manager.lock()
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with kernel_resolution_guard("prepared MLA prefill replay"):
+                with session.capture(), torch.cuda.graph(graph):
+                    actual, lse = run()
+                q.neg_()
+                kv.mul_(-0.5)
+                graph.replay()
+                check(actual, lse)
+                assert actual.data_ptr() == out.data_ptr()
+        finally:
+            graph.reset()

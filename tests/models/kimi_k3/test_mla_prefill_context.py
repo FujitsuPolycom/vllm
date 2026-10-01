@@ -431,6 +431,49 @@ def test_fused_context_rejects_an_unquantized_query() -> None:
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("gate_layout", ["fused", "separate", "none"])
+def test_q_lora_uses_the_configured_output_gate_projection(gate_layout):
+    """Separate checkpoint formats keep the MLA gate outside packed Q/KV."""
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    qkv = hidden[:, :3]
+    gate = hidden[:, 3:]
+    calls = []
+
+    def project(value, output, name):
+        assert value is hidden
+        calls.append(name)
+        return output, None
+
+    layer = SimpleNamespace(
+        q_lora_rank=1,
+        kv_lora_rank=1,
+        qk_rope_head_dim=1,
+        num_local_heads=1,
+        v_head_dim=1,
+        use_output_gate=gate_layout != "none",
+        aux_stream=None,
+        _gate_events=None,
+        fused_qkv_a_g_proj=(lambda value: project(value, hidden, "fused"))
+        if gate_layout == "fused"
+        else None,
+        fused_qkv_a_proj=lambda value: project(value, qkv, "qkv"),
+        g_proj=(lambda value: project(value, gate, "gate"))
+        if gate_layout == "separate"
+        else None,
+        _apply_q_lora_attention=lambda positions, value, projected, **kwargs: projected,
+    )
+    actual, actual_gate = MultiHeadLatentAttention._forward_q_lora(
+        layer, torch.arange(2), hidden
+    )
+    torch.testing.assert_close(actual, qkv, rtol=0, atol=0)
+    if gate_layout == "none":
+        assert actual_gate is None
+        assert calls == ["qkv"]
+    else:
+        torch.testing.assert_close(actual_gate, gate, rtol=0, atol=0)
+        assert calls == (["fused"] if gate_layout == "fused" else ["qkv", "gate"])
+
+
 def test_bf16_nope_prefill_writes_fp8_cache_without_quantizing_attention():
     """Cache storage precision must not force lower-precision prefill Q/K/V."""
     torch.manual_seed(411)

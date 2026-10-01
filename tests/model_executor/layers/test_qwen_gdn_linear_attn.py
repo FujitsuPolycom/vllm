@@ -20,6 +20,7 @@ def _make_config(
 ) -> Any:
     return SimpleNamespace(
         additional_config={"gdn_prefill_backend": requested},
+        kernel_config=SimpleNamespace(linear_backend="b12x", moe_backend="b12x"),
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             hf_text_config=SimpleNamespace(
@@ -292,3 +293,55 @@ def test_gdn_projection_overlap_preserves_stream_and_scratch_ownership(
         assert events == [("qkvz", "run", "main"), ("ba", "run", "main")]
         hidden.record_stream.assert_not_called()
         outputs["ba"].record_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("pool_slots", [1, 3])
+@pytest.mark.parametrize("clear_cache", [False, True])
+def test_b12x_prefill_trial_restores_bound_pool_after_cache_change(
+    pool_slots: int, clear_cache: bool
+) -> None:
+    """Exercise the real restore callback on CPU without launching a kernel."""
+    capacity = 2
+    pool = torch.arange(pool_slots * 4, dtype=torch.float32).view(pool_slots, 4)
+    saved = pool.clone()
+    replacement = torch.full_like(pool, -7)
+    staging = SimpleNamespace(
+        mixed_qkv=torch.empty(capacity, 384),
+        a=torch.empty(capacity, 1),
+        b=torch.empty(capacity, 1),
+        output=torch.empty(capacity, 1, 128),
+        query_start_loc=torch.empty(2, dtype=torch.int32),
+        initial_indices=torch.empty(1, dtype=torch.int32),
+        final_indices=torch.empty(1, dtype=torch.int32),
+        checkpoint_indices=torch.empty(1, dtype=torch.int32),
+        checkpoint_offsets=torch.empty(1, dtype=torch.int32),
+        num_seqs=torch.empty(1, dtype=torch.int32),
+        num_tokens=torch.empty(1, dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        kv_cache=(torch.empty(0), pool),
+        _ensure_b12x_gdn_prefill_staging=lambda: staging,
+        _b12x_local_key_heads=1,
+        _b12x_local_value_heads=1,
+        head_k_dim=128,
+        head_v_dim=128,
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(1),
+    )
+    state = SimpleNamespace(
+        layout=SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(shape=(1,), dtype=torch.uint8),)
+        ),
+        bind=MagicMock(),
+    )
+    call = qwen_gdn_linear_attn.QwenGatedDeltaNetAttention._b12x_gdn_prefill_call(
+        layer, state, capacity, benchmark=True
+    )
+    assert state.bind.call_args.kwargs["recurrent_state"] is pool
+    layer.kv_cache = () if clear_cache else (torch.empty(0), replacement)
+    slot = min(1, pool_slots - 1)
+    for restore in (call.reset, call.restore):
+        pool[slot].fill_(99)
+        restore()
+        torch.testing.assert_close(pool, saved)
+        torch.testing.assert_close(replacement, torch.full_like(replacement, -7))

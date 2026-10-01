@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Iterable
-from contextlib import ExitStack
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -610,9 +609,8 @@ class B12xPreparedBatch:
 
     def release(self) -> None:
         plans, self.plans = self.plans, ()
-        with ExitStack() as stack:
-            for plan in plans:
-                stack.callback(self.session.release, plan)
+        if plans:
+            self.session.release_many(reversed(plans))
 
 
 def initialize_b12x_tuning_cache(worker: Worker, kv_cache_config) -> bool:

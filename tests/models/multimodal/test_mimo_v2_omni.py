@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MiMo-V2 checkpoint loading and vision window attention."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -222,3 +224,88 @@ def test_fp8_qkv_merges_training_shards(num_kv_heads, tp_rank, metadata_only):
     ]
     expected = torch.cat([part for parts in zip(*rank_shards) for part in parts])
     torch.testing.assert_close(actual, expected)
+
+
+def _mimo_processor():
+    from vllm.transformers_utils.processors.mimo_v2_omni import MiMoVLProcessor
+
+    return MiMoVLProcessor(
+        tokenizer=None,
+        patch_size=16,
+        image_min_pixels=8192,
+        image_max_pixels=8388608,
+        video_min_pixels=8192,
+        video_max_pixels=8388608,
+        video_total_max_pixels=268435456,
+        fps=1.0,
+    )
+
+
+def test_audio_features_without_torchaudio(monkeypatch):
+    """Audio preprocessing works without torchaudio and matches it."""
+    import vllm.transformers_utils.processors.mimo_v2_omni as processor_module
+    from vllm.multimodal.audio import MelSpectrogram
+
+    wave = torch.randn(32000, generator=torch.Generator().manual_seed(7))
+    audio = (wave, 16000)  # resampled to 24 kHz inside the processor
+
+    reference = None
+    if processor_module._HAS_TORCHAUDIO:
+        reference = _mimo_processor().preprocess_audio(audio)
+
+    monkeypatch.setattr(processor_module, "_MelSpectrogram", MelSpectrogram)
+    monkeypatch.setattr(processor_module, "_HAS_TORCHAUDIO", False)
+    spec, token_len = _mimo_processor().preprocess_audio(audio)
+
+    # 48000 samples at 24 kHz, hop 240: 201 frames of 128 log-mel bins.
+    assert spec.shape == (201, 128)
+    assert token_len == 13
+    if reference is not None:
+        assert torch.equal(spec, reference[0])
+        assert token_len == reference[1]
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_fp8_qkv_loads_across_interleaved_modules(monkeypatch, scale_first):
+    from vllm.model_executor.models import mimo_v2
+
+    monkeypatch.setattr(mimo_v2, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(mimo_v2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(mimo_v2.MiMoV2Model, "get_expert_mapping", lambda self: [])
+    model = mimo_v2.MiMoV2FlashForCausalLM.__new__(mimo_v2.MiMoV2FlashForCausalLM)
+    torch.nn.Module.__init__(model)
+    backbone = mimo_v2.MiMoV2Model.__new__(mimo_v2.MiMoV2Model)
+    torch.nn.Module.__init__(backbone)
+    backbone.config = SimpleNamespace(num_key_value_heads=2)
+    backbone._pending_fp8_qkv_proj = {}
+    model.model = backbone
+    model.lm_head = torch.nn.Linear(4, 2, bias=False)
+    layer = torch.nn.Module()
+    backbone.layers = torch.nn.ModuleList([layer])
+    attn = layer.self_attn = torch.nn.Module()
+    attn.total_num_heads, attn.total_num_kv_heads = 4, 2
+    attn.head_dim = attn.v_head_dim = 2
+    proj = attn.qkv_proj = torch.nn.Module()
+    proj.weight = torch.nn.Parameter(
+        torch.zeros(8, 4).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    proj.weight_scale_inv = torch.nn.Parameter(torch.zeros(1, 1), requires_grad=False)
+    prefix = "model.layers.0.self_attn.qkv_proj"
+    weight = torch.arange(64).reshape(16, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5], [2.0]])
+    pair = [(f"{prefix}.weight", weight), (f"{prefix}.weight_scale_inv", scale)]
+    if scale_first:
+        pair.reverse()
+
+    loaded = model.load_weights(
+        [pair[0], ("lm_head.weight", torch.ones(2, 4)), pair[1]]
+    )
+
+    assert loaded == {
+        f"{prefix}.weight",
+        f"{prefix}.weight_scale_inv",
+        "lm_head.weight",
+    }
+    torch.testing.assert_close(proj.weight.float(), weight[8:].float())
+    torch.testing.assert_close(proj.weight_scale_inv, scale[1:])
+    assert not backbone._pending_fp8_qkv_proj

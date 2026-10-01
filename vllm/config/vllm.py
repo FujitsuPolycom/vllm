@@ -1254,12 +1254,27 @@ class VllmConfig:
                 KVConnectorFactory,
             )
 
-            connector = KVConnectorFactory.get_connector_class(
-                self.kv_transfer_config
+            connector = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+            # Explicit aligned retention bypasses request-boundary checkpoints;
+            # it is correct only with connectors that move hybrid state at
+            # aligned boundaries, and only validated without DCP.
+            cache_config = getattr(self, "cache_config", None)
+            parallel_config = getattr(self, "parallel_config", None)
+            # External connectors need not derive from KVConnectorBase_V1.
+            supports_aligned_hybrid_transfer = getattr(
+                connector, "supports_aligned_hybrid_transfer", None
             )
-            # The retained SparkCache adapter captures aligned recurrent
+            aligned = (
+                getattr(cache_config, "recurrent_checkpoint_policy", None) == "aligned"
+                and getattr(parallel_config, "decode_context_parallel_size", None) == 1
+                and callable(supports_aligned_hybrid_transfer)
+                and supports_aligned_hybrid_transfer(self)
+            )
+            # The external SparkCache adapter captures aligned recurrent
             # blocks through source-bound read leases. It does not implement
-            # atomic target/draft request-boundary checkpoints.
+            # atomic target/draft request-boundary checkpoints, and it is
+            # accepted only in the single-node TP2/TP4 aligned profile it was
+            # validated with.
             aligned_sparkcache = (
                 self.kv_transfer_config.kv_connector == "SparkContextCacheConnector"
                 and self.kv_transfer_config.kv_connector_module_path
@@ -1279,13 +1294,16 @@ class VllmConfig:
                 and self.kv_transfer_config.kv_role == "kv_both"
             )
             if (
-                not connector.supports_request_boundary_checkpoints(self)
+                not aligned
                 and not aligned_sparkcache
+                and not connector.supports_request_boundary_checkpoints(self)
             ):
                 raise ValueError(
                     "Qwen QSA KV transfer requires an atomic request-boundary "
-                    "checkpoint connector or the source-bound aligned "
-                    "SparkCache profile"
+                    "checkpoint connector, or --recurrent-checkpoint-policy "
+                    "aligned without DCP and a connector that transfers aligned "
+                    "hybrid state (SimpleCPUOffloadConnector, OffloadingConnector, "
+                    "or the source-bound aligned SparkCache profile)"
                 )
 
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can

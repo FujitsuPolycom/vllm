@@ -162,7 +162,9 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         runner.initialize_kv_cache(kv_cache_config)
 
     assert captured["max_num_blocks_per_group"] == [1, 1]
-    assert captured["slot_mapping_enabled"] == [False, True]
+    # The worker maps the ring into its block; QSA still builds its own slots.
+    assert captured["slot_mapping_enabled"] == [True, True]
+    assert captured["slot_mapping_circular"] == [True, False]
 
 
 @pytest.mark.parametrize(
@@ -425,6 +427,8 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
         gather_batch_req_state=lambda *args: (SimpleNamespace(num_tokens=1), 1),
         prepare_inputs=lambda *args: input_batch,
         prepare_attn=lambda *args: pytest.fail("logits-only must skip attention"),
+        draft_tokens_handler=SimpleNamespace(set_consumed_draft_tokens=lambda *a: None),
+        req_states=SimpleNamespace(draft_tokens=None),
     )
     monkeypatch.setattr(
         model_runner_module,

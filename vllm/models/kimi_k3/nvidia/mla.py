@@ -25,7 +25,7 @@ KV cache, and absorbs ``kv_b_proj`` into ``W_UK_T`` / ``W_UV`` -- mirroring the
 
 K3 specifics: optional rotary embedding (disabled for the target model's NoPE
 layers, enabled for DSpark) and an optional sigmoid output gate (``g_proj``,
-merged into ``fused_qkv_a_g_proj`` when the q-LoRA front-end is present).
+merged into ``fused_qkv_a_g_proj`` when its checkpoint precision matches Q/KV).
 
 Out of scope (extension points, not wired here): prefill context parallelism
 (PCP), sparse/indexer MLA, and the ROCm/aiter fp8/fp4 BMM fast paths.
@@ -93,6 +93,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     can_reuse_projection_output,
     enable_kimi_projection_tail_padding,
     project_into_consumed_output,
+    projection_checkpoint_dimensions,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -112,7 +113,6 @@ from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
-    KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     get_kv_quant_mode,
@@ -230,6 +230,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.fused_qkv_a_proj: MergedColumnParallelLinear | None = None
         self.fused_qkv_a_g_proj: KimiK3MergedQKVGateLinear | None = None
         self.q_proj: ColumnParallelLinear | None = None
+        self.q_b_proj: ColumnParallelLinear | None = None
         self.kv_a_proj_with_mqa: ReplicatedLinear | None = None
         self.g_proj: ColumnParallelLinear | None = None
         self.aux_stream: torch.cuda.Stream | None = None
@@ -339,7 +340,26 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.o_proj",
         )
         if num_heads != getattr(config, "original_num_attention_heads", num_heads):
-            for projection in (self.q_b_proj, self.kv_b_proj, self.g_proj, self.o_proj):
+            original_heads = config.original_num_attention_heads
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    "q_proj": (0, original_heads * self.qk_head_dim),
+                    "q_b_proj": (0, original_heads * self.qk_head_dim),
+                    "kv_b_proj": (
+                        0,
+                        original_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                    ),
+                    "g_proj": (0, original_heads * self.v_head_dim),
+                    "o_proj": (1, original_heads * self.v_head_dim),
+                }
+            )
+            for projection in (
+                self.q_proj,
+                self.q_b_proj,
+                self.kv_b_proj,
+                self.g_proj,
+                self.o_proj,
+            ):
                 if projection is not None:
                     enable_kimi_projection_tail_padding(projection)
         self.gemm_rs_ar = None
@@ -399,8 +419,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             kv_b_proj=self.kv_b_proj,
             indexer=None,
         )
-        if getattr(self.impl, "b12x_preparation_provider", None) is not None:
-            set_b12x_preparation_provider(self, self.impl.b12x_preparation_provider)
+        provider = getattr(self.impl, "b12x_preparation_provider", None)
+        if provider is not None:
+            set_b12x_preparation_provider(self, provider)
         if getattr(self.impl, "dcp_world_size", -1) < 1:
             # FlashAttention requires the cp_world_size is positive and the cp_rank
             # is non negative; manually set here if not set by caller (-1 is unset)
@@ -439,7 +460,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=False,
                 use_b12x=(
-                    self.attn_backend.get_name() == "B12X_MLA"
+                    self.attn_backend.get_name() == "B12X"
                     and envs.VLLM_USE_B12X_DCP_A2A
                 ),
             )
@@ -452,6 +473,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             v_head_dim=self.v_head_dim,
             vllm_config=vllm_config,
         )
+        if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
+            set_b12x_preparation_provider(self, self)
+
         if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
             set_b12x_preparation_provider(self, self)
 
@@ -482,7 +506,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_spec(
+        self, vllm_config: VllmConfig
+    ) -> MLAAttentionSpec | SlidingWindowMLASpec:
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
@@ -620,6 +646,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.kv_a_layernorm.weight.data,
             self.rms_norm_eps,
         )
+        assert self.q_b_proj is not None
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
         attn_out = torch.empty(
@@ -674,9 +701,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         # run g_proj together with qkv_a
         if self.fused_qkv_a_g_proj is not None:
-            qkv_a_proj = self.fused_qkv_a_g_proj
-            assert qkv_a_proj is not None
-            qkv_lora, gate = qkv_a_proj(hidden_states)[0].split(
+            qkv_lora, gate = self.fused_qkv_a_g_proj(hidden_states)[0].split(
                 [qkv_a_rows, self.num_local_heads * self.v_head_dim], dim=-1
             )
         else:

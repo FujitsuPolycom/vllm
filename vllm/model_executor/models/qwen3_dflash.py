@@ -20,6 +20,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.distributed.parallel_state import (
+    declare_b12x_fused_allreduce_rms_norm_sites,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -465,6 +468,38 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _context_kv_rows(
+    attn: nn.Module, dtype: torch.dtype, *, packed_mxfp8: bool
+) -> torch.Tensor:
+    """One layer's K/V projection rows for the fused context projection.
+
+    Serialized MXFP8 rows stay packed for the fused projection's own linear
+    method. Block-FP8 rows (serialized, or online ``fp8_per_block``, which
+    quantizes while loading) are dequantized with their block scales, so the
+    fused projection runs in ``dtype`` while each layer keeps its FP8 GEMM.
+    """
+    projection = attn.qkv_proj
+    rows = projection.weight[attn.q_size :]
+    scale = getattr(projection, "weight_scale_inv", None)
+    if (
+        packed_mxfp8
+        or scale is None
+        or rows.dtype
+        not in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        )
+    ):
+        return rows
+    block_n, block_k = getattr(projection, "weight_block_size", None) or (128, 128)
+    if attn.q_size % block_n:
+        raise ValueError("DFlash block-FP8 K/V rows must start on a scale block.")
+    scales = scale[attn.q_size // block_n :].float()
+    scales = scales.repeat_interleave(block_n, 0)[: rows.shape[0]]
+    scales = scales.repeat_interleave(block_k, 1)[:, : rows.shape[1]]
+    return (rows.float() * scales).to(dtype)
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -551,15 +586,18 @@ class DFlashQwen3Model(nn.Module):
                 and envs.VLLM_DFLASH_AUX_BF16_STAGING
             ):
                 raise ValueError("Select either MXFP8 or BF16 auxiliary input staging")
-            fc_cls = ReplicatedLinear
-            fc_kwargs = {}
+            # Shard the context projection's output features across TP ranks
+            # and all-gather the result: every output element keeps its full
+            # dot product (bit-identical to a replicated layer) while each rank
+            # streams 1/tp of the [hidden, num_aux * hidden] weight per step.
+            # A hidden width that TP does not divide is padded to whole
+            # 128-channel tiles; callers slice the gathered output back.
+            fc_tp_size = get_tensor_model_parallel_world_size()
+            tp_fc = fc_tp_size > 1
+            fc_cls = ColumnParallelLinear if tp_fc else ReplicatedLinear
             fc_output_size = self.config.hidden_size
-            if envs.VLLM_DFLASH_SHARD_AUX_PROJECTION:
-                fc_cls = ColumnParallelLinear
-                fc_kwargs["gather_output"] = True
-                fc_output_size = _dflash_padded_width(
-                    fc_output_size, get_tensor_model_parallel_world_size()
-                )
+            if tp_fc:
+                fc_output_size = _dflash_padded_width(fc_output_size, fc_tp_size)
             self.fc = fc_cls(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
@@ -570,7 +608,7 @@ class DFlashQwen3Model(nn.Module):
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
-                **fc_kwargs,
+                **({"gather_output": True} if tp_fc else {}),
             )
             if fc_output_size != self.config.hidden_size:
                 _enable_dflash_tp_padding(self.fc)
@@ -610,9 +648,11 @@ class DFlashQwen3Model(nn.Module):
                 # Preserve BF16 activations through the same W8A16 linear path
                 # used without staging; weight sharding does not quantize inputs.
                 method.kernel = MarlinMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+        # Streamed auxiliary projections run on this rank's FC output shard and
+        # gather complete activations afterwards.
         self._aux_projection_tp_size = (
             get_tensor_model_parallel_world_size()
-            if envs.VLLM_DFLASH_SHARD_AUX_PROJECTION
+            if isinstance(getattr(self, "fc", None), ColumnParallelLinear)
             else 1
         )
         self._streamed_aux_layer_ids = tuple(
@@ -634,6 +674,21 @@ class DFlashQwen3Model(nn.Module):
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
+        )
+        # Residual RMSNorms fed by a TP all-reduce: post-attention norms, input
+        # norms of layers 1.., and the final norm.
+        fused_norms = []
+        for i, layer in enumerate(self.layers):
+            fused_norms.append(
+                (f"layers.{i}.post_attention_layernorm", layer.post_attention_layernorm)
+            )
+            if i > 0:
+                fused_norms.append(
+                    (f"layers.{i}.input_layernorm", layer.input_layernorm)
+                )
+        fused_norms.append(("norm", self.norm))
+        declare_b12x_fused_allreduce_rms_norm_sites(
+            self, fused_norms, self.config.hidden_size, "dflash"
         )
         # The context projection concatenates K/V weights from every draft
         # layer. It is not a LinearBase module because its output layout is a
@@ -806,7 +861,12 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [
+            _context_kv_rows(
+                a, self.hidden_norm.weight.dtype, packed_mxfp8=all(uses_mxfp8)
+            )
+            for a in layers_attn
+        ]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
 
         if all(uses_mxfp8):
@@ -1174,6 +1234,19 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         logits_new[:, targets] = logits
         return logits_new
+
+    def compute_local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab-shard logits, not gathered, for vocab-parallel
+        drafting (the speculator validates the shard layout: no vocab padding,
+        no added vocab, no draft-to-target id map)."""
+        lp = self.logits_processor
+        logits = lp._apply_head(self.lm_head, hidden_states, None)
+        logits = logits[..., : self.lm_head.shard_indices.num_org_elements]
+        if lp.soft_cap is not None:
+            logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
+        if lp.scale != 1.0:
+            logits = logits * lp.scale
+        return logits
 
     def precompute_and_store_context_kv(
         self,

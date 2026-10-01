@@ -288,8 +288,10 @@ class LatentMoERunner(MoERunner):
             latent = tensor_model_parallel_all_reduce(fused_output)
 
         weight = transform.up_proj.weight
-        shard_size = weight.shape[0] // self.moe_config.tp_size
-        shard_start = get_tensor_model_parallel_rank() * shard_size
+        shard_size, remainder = divmod(weight.shape[0], self.moe_config.tp_size)
+        rank = get_tensor_model_parallel_rank()
+        shard_start = rank * shard_size + min(rank, remainder)
+        shard_size += int(rank < remainder)
 
         # column-parallel
         up_proj_shard = weight.narrow(0, shard_start, shard_size)

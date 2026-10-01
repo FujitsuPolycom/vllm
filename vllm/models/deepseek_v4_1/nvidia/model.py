@@ -3,7 +3,6 @@
 import copy
 import typing
 from collections.abc import Callable, Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import islice
 
 import regex as re
@@ -463,19 +462,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ),
                 persistent=False,
             )
-            # Disk rows may arrive while the target graph runs its first layer:
-            # a side stream publishes an epoch that Engram layers wait for.
-            self._engram_overlap = envs.VLLM_DS41_ENGRAM_OVERLAP
-            self._engram_epoch = 0
-            self._engram_job: Future | None = None
-            if self._engram_overlap:
-                self._engram_epochs = torch.zeros(
-                    3, dtype=torch.int64, device=caps.device
-                )
-                epochs = tuple(self._engram_epochs[i : i + 1] for i in range(3))
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    if getattr(layer, "engram", None) is not None:
-                        layer.engram.overlap_epochs = epochs
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -495,46 +481,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
-    def _engram_stream(self) -> torch.cuda.Stream:
-        stream = getattr(self, "_engram_side_stream", None)
-        if stream is None:
-            stream = self._engram_side_stream = torch.cuda.Stream()
-        return stream
-
-    def _finish_engram_job(self) -> None:
-        job, self._engram_job = getattr(self, "_engram_job", None), None
-        if job is not None:
-            job.result()
-
-    def _start_engram_job(self, bindings, counts) -> None:
-        self._engram_epoch += 1
-        epoch = self._engram_epoch
-        self._engram_epochs[1:2].fill_(epoch)
-        ready = torch.cuda.Event()
-        ready.record()
-        stream = self._engram_stream()
-        device = torch.accelerator.current_device_index()
-
-        def lookup():
-            torch.accelerator.set_device_index(device)
-            with torch.inference_mode(), torch.cuda.stream(stream):
-                stream.wait_event(ready)
-                engram_native.run_lookups(bindings, counts, clear_tail=False)
-                self._engram_epochs[0:1].fill_(epoch)
-
-        pool = getattr(self, "_engram_pool", None)
-        if pool is None:
-            pool = self._engram_pool = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="ds41-engram"
-            )
-        self._engram_job = pool.submit(lookup)
-
     def prepare_disk_engram(self, input_ids, query_start_loc, lookback_token_ids):
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
-        self._finish_engram_job()
         engrams = tuple(
             layer.engram
             for layer in islice(self.layers, self.start_layer, self.end_layer)
@@ -561,10 +512,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 for engram in engrams
             ]
             counts = [hashes.shape[0]] * len(bindings)
-            if self._engram_overlap:
-                self._start_engram_job(bindings, counts)
-            else:
-                engram_native.run_lookups(bindings, counts, clear_tail=False)
+            # Enqueue the gathers before replay: graph waits can block every
+            # CUDA work queue needed by a late side-stream lookup.
+            engram_native.run_lookups(bindings, counts, clear_tail=False)
             for engram in engrams:
                 engram.finish_disk(hashes.shape[0])
         except BaseException:
@@ -580,13 +530,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
-        self._finish_engram_job()
-        if self._engram_overlap:
-            # Dummy rows are ready at once; order after the last side-stream
-            # publication so an older epoch cannot overwrite this one.
-            torch.cuda.current_stream().wait_stream(self._engram_stream())
-            self._engram_epoch += 1
-            self._engram_epochs[:2].fill_(self._engram_epoch)
         self.prepared_engram_hashes.fill_(-1)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             if getattr(layer, "engram", None) is not None:

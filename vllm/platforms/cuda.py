@@ -184,7 +184,19 @@ def _backend_cls_path(backend_cls: type[AttentionBackend]) -> str:
     return f"{module}.{qualname}"
 
 
-def _get_attn_backend_class(backend: AttentionBackendEnum) -> type[AttentionBackend]:
+def _get_attn_backend_class(
+    backend: AttentionBackendEnum,
+    config: AttentionSelectorConfig,
+) -> type[AttentionBackend]:
+    if (
+        backend == AttentionBackendEnum.B12X
+        and not backend.is_overridden()
+        and config.use_mla
+        and not config.use_sparse
+    ):
+        from vllm.v1.attention.backends.mla.b12x_mla import B12xMLABackend
+
+        return B12xMLABackend
     return backend.get_class()
 
 
@@ -407,7 +419,7 @@ class CudaPlatformBase(Platform):
         )
         for priority, backend in enumerate(backend_priorities):
             try:
-                backend_class = _get_attn_backend_class(backend)
+                backend_class = _get_attn_backend_class(backend, attn_selector_config)
                 invalid_reasons_i = backend_class.validate_configuration(
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
@@ -459,7 +471,9 @@ class CudaPlatformBase(Platform):
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
             try:
-                backend_class = _get_attn_backend_class(selected_backend)
+                backend_class = _get_attn_backend_class(
+                    selected_backend, attn_selector_config
+                )
                 invalid_reasons = backend_class.validate_configuration(
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),

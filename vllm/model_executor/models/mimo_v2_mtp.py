@@ -327,6 +327,7 @@ class MiMoV2MTP(nn.Module):
                         tp_rank=tp_rank,
                         tp_size=tp_size,
                         checkpoint_tp_size=self.config.num_key_value_heads,
+                        kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
                     )
                     for k, tensor in (("weight", w_rank), ("weight_scale_inv", s_rank)):
                         param = params_dict[f"{prefix}.{k}"]

@@ -100,7 +100,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
     init_kv_cache,
 )
-from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
 from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 from vllm.v1.worker.gpu.buffer_utils import (
     set_default_max_concurrency,
@@ -305,7 +305,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.use_aux_hidden_state_outputs = True
 
         # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device,
+            track_consumed_drafts=bool(self.scheduler_config.async_scheduling)
+            and self.speculative_config is not None
+            and self.is_last_pp_rank,
+        )
 
         self.pcp_manager: pcp.PCPManager | None = None
 
@@ -617,6 +622,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_sizes = []
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
+        slot_mapping_circular = []
         group_cp_sizes = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
@@ -624,7 +630,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
-            slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
+            mapping_enabled, mapping_circular = slot_mapping_mode(layer_spec)
+            slot_mapping_enabled.append(mapping_enabled)
+            slot_mapping_circular.append(mapping_circular)
             group_cp_sizes.append(
                 1 if getattr(layer_spec, "dcp_replicated", False) else self.dcp_size
             )
@@ -707,6 +715,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
             slot_mapping_enabled=slot_mapping_enabled,
+            slot_mapping_circular=slot_mapping_circular,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
@@ -1957,6 +1966,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
+            )
+            # Deferred structured-output sampling back-fills the scheduler's
+            # draft placeholders with exactly the drafts these inputs hold.
+            self.draft_tokens_handler.set_consumed_draft_tokens(
+                input_batch, self.req_states.draft_tokens
             )
             if scheduler_output.boundary_logits_only:
                 assert self.boundary_checkpoint_state is not None

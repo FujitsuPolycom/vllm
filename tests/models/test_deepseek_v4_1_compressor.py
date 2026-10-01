@@ -24,6 +24,82 @@ def test_compressor_cache_rejects_duplicate_prefix_without_replacing_owner():
     assert config.compilation_config.static_forward_context[other.prefix] is other
 
 
+def test_compressor_ring_writes_follow_the_worker_slot_mapping():
+    """Ring metadata emits a write only for rows with a valid worker slot. With
+    the runner's per-spec settings, a verify step past the ring capacity writes
+    every real row into its request's ring block, and graph padding writes
+    nothing."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("DeepSeek-V4.1 metadata kernels require SM12x")
+
+    from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
+    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=4),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=7, parallel_drafting=False
+        ),
+    )
+    ring = CompressorStateCache(config, "layer.state_cache").get_kv_cache_spec(config)
+    main = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=288,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+    )
+    specs = (main, ring)
+    enabled, circular = zip(*(slot_mapping_mode(spec) for spec in specs))
+    tables = BlockTables(
+        block_sizes=[spec.block_size for spec in specs],
+        max_num_reqs=4,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[2, 1],
+        device=device,
+        kernel_block_sizes=[spec.block_size for spec in specs],
+        slot_mapping_enabled=list(enabled),
+        slot_mapping_circular=list(circular),
+    )
+    tables.append_block_ids(req_index=0, new_block_ids=([1], [5]), overwrite=True)
+    tables.append_block_ids(req_index=1, new_block_ids=([2], [6]), overwrite=True)
+    tables.apply_staged_writes()
+
+    # A verify step (bonus token and seven drafts) at positions 40-47, a single
+    # token at position 3, then two tokens of graph padding.
+    positions = list(range(40, 48)) + [3, 0, 0]
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 8, 9], dtype=torch.int32, device=device)
+    slot_mappings = tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        torch.tensor(positions, dtype=torch.int64, device=device),
+        num_tokens_padded=len(positions),
+    )
+    cm = SimpleNamespace(
+        query_start_loc=query_start_loc,
+        seq_lens=torch.tensor([48, 4], dtype=torch.int32, device=device),
+        block_table_tensor=tables.gather_block_tables(idx_mapping, 2)[1],
+        slot_mapping=slot_mappings[1],
+        num_reqs=2,
+        num_actual_tokens=len(positions),
+        max_query_len=8,
+        max_seq_len=48,
+    )
+    builder = DeepseekV41B12xMetadataBuilder(ring, ["layer"], config, device)
+    state = builder.build(0, cm)
+    torch.accelerator.synchronize()
+
+    size = ring.block_size
+    expected = [5 * size + p % size for p in range(40, 48)] + [6 * size + 3, -1, -1]
+    assert state.slot_mapping[: len(positions)].tolist() == expected
+
+
 @pytest.fixture
 def native_compressor_runners(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:

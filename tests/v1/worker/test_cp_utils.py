@@ -38,7 +38,7 @@ def test_skip_gate_only_for_zero_context():
     )
 
 
-@pytest.mark.parametrize("backend_name", ["FLASH_ATTN", "TRITON_ATTN", "B12X_MLA"])
+@pytest.mark.parametrize("backend_name", ["FLASH_ATTN", "TRITON_ATTN", "B12X"])
 def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch, backend_name):
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 

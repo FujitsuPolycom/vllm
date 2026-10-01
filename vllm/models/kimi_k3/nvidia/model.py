@@ -15,6 +15,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
@@ -121,6 +122,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     can_reuse_projection_output,
     enable_kimi_projection_tail_padding,
     project_into_consumed_output,
+    projection_checkpoint_dimensions,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
@@ -312,6 +314,13 @@ class KimiMLP(nn.Module):
         if intermediate_size != checkpoint_intermediate_size:
             enable_kimi_projection_tail_padding(self.gate_up_proj)
             enable_kimi_projection_tail_padding(self.down_proj)
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    "gate_proj": (0, checkpoint_intermediate_size),
+                    "up_proj": (0, checkpoint_intermediate_size),
+                    "down_proj": (1, checkpoint_intermediate_size),
+                }
+            )
         self.gemm_rs_ar = None
         # RS requires sequence sharding; AR operates on replicated tokens.
         use_gemm_rs_ar = self.shard_sequence_parallel or (
@@ -751,6 +760,7 @@ class KimiMoE(nn.Module):
             raise NotImplementedError(
                 "Kimi K3 MegaMoE currently requires one expert group."
             )
+        is_exl3 = quant_config is not None and quant_config.get_name() == "exl3"
         self.padded_moe_intermediate_size = moe_intermediate_size
         min_moe_intermediate_per_partition = getattr(
             config, "min_moe_intermediate_per_partition", 256
@@ -759,25 +769,27 @@ class KimiMoE(nn.Module):
             vllm_config.model_config.quantization == "mxfp4"
             and vllm_config.kernel_config.moe_backend == "b12x"
         )
-        exl3_experts = quant_config is not None and quant_config.get_name() == "exl3"
         self._aligned_decode_projections = (
-            exl3_experts and envs.VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS
+            is_exl3 and envs.VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS
         )
         self.register_buffer("_paired_decode_weight", None, persistent=False)
-        if exl3_experts:
+        if is_exl3:
             from vllm.model_executor.layers.quantization.utils.exl3 import (
                 load_exl3_manifest,
                 plan_exl3_extent,
             )
 
-            manifest = load_exl3_manifest(str(vllm_config.model_config.model))
-            # Reserve the widest rank's activation capacity, not padded weights.
-            self.padded_moe_intermediate_size = self.tp_size * max(
-                plan_exl3_extent(
-                    manifest, layer_idx, self.tp_size, rank
-                ).intermediate_size
-                for rank in range(self.tp_size)
+            manifest = load_exl3_manifest(vllm_config.model_config.model)
+            if (
+                manifest.geometry.num_slots * manifest.geometry.slot_channels
+                != moe_intermediate_size
+            ):
+                raise ValueError("EXL3 manifest intermediate size does not match Kimi")
+            extent = plan_exl3_extent(
+                manifest, layer_idx, self.tp_size, get_tensor_model_parallel_rank()
             )
+            # FusedMoE divides this runtime width by TP; storage uses the extent.
+            self.padded_moe_intermediate_size = extent.intermediate_size * self.tp_size
         elif (
             self.tp_size > 1
             and not vllm_config.parallel_config.enable_expert_parallel
@@ -975,10 +987,7 @@ class KimiMoE(nn.Module):
                 is_sequence_parallel=use_sequence_parallel,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
             )
-        if (
-            self.padded_moe_intermediate_size != moe_intermediate_size
-            and not exl3_experts
-        ):
+        if not is_exl3 and self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
                 w13_weight = getattr(self.experts, "w13_weight_packed", None)
@@ -1431,6 +1440,8 @@ class KimiDecoderLayer(nn.Module):
 
 
 class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+    _attn_res_workspace: torch.Tensor | None
+
     def _get_attn_res_workspace(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Reuse block-major storage for serialized target-model execution."""
         shape = (
@@ -1720,6 +1731,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
         )
         if stream_aux_hidden_states:
+            assert projector is not None
             projector.begin_auxiliary_stream(hidden_states)
 
         # sharded aux hidden states when sp is enabled
@@ -1729,6 +1741,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             and self.start_layer in self.aux_hidden_state_layers
         ):
             if stream_aux_hidden_states:
+                assert projector is not None
                 projector.accumulate_auxiliary_state(
                     hidden_states, None if self.use_attn_res else residual
                 )
@@ -1776,6 +1789,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     aux_hidden_state = hidden_states + residual
 
                 if stream_aux_hidden_states:
+                    assert projector is not None
                     projector.accumulate_auxiliary_state(aux_hidden_state, None)
                     del aux_hidden_state
                 else:
@@ -1835,6 +1849,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
         if stream_aux_hidden_states:
+            assert projector is not None
             aux_hidden_states.append(projector.finish_auxiliary_stream())
         aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
@@ -1847,6 +1862,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]
         ],
     ) -> set[str]:
+        from .tp_projection import validate_checkpoint_tensor
+
+        checkpoint_dimensions = {
+            f"{prefix}.{name}": dimension
+            for prefix, module in self.named_modules()
+            for name, dimension in getattr(
+                module, "_tp_checkpoint_dimensions", {}
+            ).items()
+        }
         kda_config = self.config.linear_attn_config
         use_full_rank_gate = bool(
             kda_config and kda_config.get("use_full_rank_gate", False)
@@ -1920,6 +1944,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         loaded_params: set[str] = set()
         for args in weights:
             name, loaded_weight = args[0], args[1]
+            validate_checkpoint_tensor(name, loaded_weight, checkpoint_dimensions)
             kwargs: dict[str, Any] = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue

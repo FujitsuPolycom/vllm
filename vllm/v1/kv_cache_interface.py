@@ -277,8 +277,8 @@ class KVCacheSpec:
     def uses_slot_mapping(self) -> bool:
         """Whether the worker computes a per-token slot mapping for this spec.
 
-        Specs that address their pages themselves (raw storage, ring buffers)
-        take no slot mapping row.
+        Specs that address their pages themselves (raw storage) take no slot
+        mapping row.
         """
         return True
 
@@ -925,6 +925,10 @@ class CircularBufferSpec(AttentionSpec):
     by the speculative lookahead: a speculative step stores all of its rows,
     drafts included, before acceptance is known, while the next step still
     reads the open group's committed keys from the ring.
+
+    The worker maps every real row into that block at its position modulo
+    ``block_size`` and padding rows to the pad slot; owners write only rows
+    with a valid slot.
     """
 
     @property
@@ -949,10 +953,6 @@ class CircularBufferSpec(AttentionSpec):
 
     @property
     def prefix_cacheable(self) -> bool:
-        return False
-
-    @property
-    def uses_slot_mapping(self) -> bool:
         return False
 
 
@@ -1000,7 +1000,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
         dcp_replicated_set = {spec.dcp_replicated for spec in specs}
-        non_causal_set = {spec.non_causal_multi_token_decode for spec in specs}
         prefix_policy_set = {
             (spec.prefix_cache_enabled, spec.prefill_replay_window) for spec in specs
         }
@@ -1011,13 +1010,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
             and len(dcp_replicated_set) == 1
-            and len(non_causal_set) == 1
             and len(prefix_policy_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
             "window size, retained token count, DCP replication mode, "
-            "non-causal mode, and prefix policy."
+            "and prefix policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -1032,8 +1030,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
             dcp_replicated=dcp_replicated_set.pop(),
-            non_causal_multi_token_decode=non_causal_set.pop(),
             prefix_cache_enabled=specs[0].prefix_cache_enabled,
             prefill_replay_window=specs[0].prefill_replay_window,
         )
@@ -1045,7 +1045,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
             and spec.dcp_replicated == self.dcp_replicated
-            and spec.non_causal_multi_token_decode == self.non_causal_multi_token_decode
             and spec.prefix_cacheable == self.prefix_cacheable
             and spec.prefill_replay_tokens == self.prefill_replay_tokens
             for spec in kv_cache_specs.values()
@@ -1089,6 +1088,13 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    # Frozen boundary capture: at every retention-grid crossing the step
+    # commits, the manager copies the live state column into a dedicated
+    # single-writer pool block before the column advances, so a connector
+    # boundary store never sources a column the next forward can clobber.
+    # Independent of `num_prefill_checkpoint_blocks` (the in-forward kernel
+    # export), which this model's backend cannot address safely.
+    boundary_capture: bool = False
 
     def prefill_checkpoint_indices(
         self, num_computed_tokens: int, num_tokens: int

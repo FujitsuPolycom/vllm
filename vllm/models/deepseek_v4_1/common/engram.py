@@ -616,26 +616,6 @@ class ParallelEngramEmbedding(nn.Module):
         self.lookup_native(indices, out)
 
 
-@triton.jit
-def _wait_engram_rows(ready, expected, failed, timeout_ms):
-    """Spin until the side-stream lookup publishes this step's epoch."""
-    target = tl.load(expected)
-    timeout_ns = timeout_ms.to(tl.int64) * 1_000_000
-    start = tl.inline_asm_elementwise(
-        "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
-    )
-    waiting = (tl.load(ready, volatile=True) < target).to(tl.int32)
-    while waiting != 0:
-        now = tl.inline_asm_elementwise(
-            "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
-        )
-        if now - start > timeout_ns:
-            tl.store(failed, 1)
-            waiting = 0
-        else:
-            waiting = (tl.load(ready, volatile=True) < target).to(tl.int32)
-
-
 class Engram(nn.Module):
     def __init__(
         self,
@@ -664,8 +644,6 @@ class Engram(nn.Module):
         )
         self._disk_prepared = False
         self._disk_prepared_tokens = 0
-        # (ready, expected, failed) epochs when disk rows arrive asynchronously.
-        self.overlap_epochs: tuple[torch.Tensor, ...] | None = None
         projection_tp = getattr(layout, "projection_tp", False)
         projection_cls = ColumnParallelLinear if projection_tp else ReplicatedLinear
         self.wkv = projection_cls(
@@ -897,8 +875,6 @@ class Engram(nn.Module):
             )
         ):
             raise RuntimeError("Disk Engram output is not prepared")
-        if self.overlap_epochs is not None:
-            _wait_engram_rows[(1,)](*self.overlap_epochs, 5000)
         rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
         kv = self.wkv(rows)
         state = hidden_states.flatten(1)

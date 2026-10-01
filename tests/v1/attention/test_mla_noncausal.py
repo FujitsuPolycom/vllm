@@ -122,21 +122,25 @@ def test_noncausal_decode_metadata_keeps_live_request_buffers():
     )
 
 
-def test_mla_cache_marker_is_promoted_to_group_capability():
+@pytest.mark.parametrize("sliding_window", [None, 4096])
+def test_mla_cache_marker_is_promoted_to_group_capability(sliding_window):
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
     kwargs = {
         "block_size": 64,
         "num_kv_heads": 1,
         "head_size": 576,
         "dtype": torch.bfloat16,
     }
-    marked = MLAAttentionSpec(**kwargs, non_causal_multi_token_decode=True)
-    unmarked = MLAAttentionSpec(**kwargs)
+    if sliding_window is not None:
+        kwargs["sliding_window"] = sliding_window
+    spec = MLAAttentionSpec if sliding_window is None else SlidingWindowMLASpec
+    marked = spec(**kwargs, non_causal_multi_token_decode=True)
+    unmarked = spec(**kwargs)
 
-    assert MLAAttentionSpec.merge([marked, marked]).non_causal_multi_token_decode
-    assert not MLAAttentionSpec.merge(
-        [unmarked, unmarked]
-    ).non_causal_multi_token_decode
-    assert MLAAttentionSpec.merge([unmarked, marked]).non_causal_multi_token_decode
+    assert spec.merge([marked, marked]).non_causal_multi_token_decode
+    assert not spec.merge([unmarked, unmarked]).non_causal_multi_token_decode
+    assert spec.merge([unmarked, marked]).non_causal_multi_token_decode
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA metadata kernel")

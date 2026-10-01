@@ -72,7 +72,11 @@ class Exl3Config(ModelOptMxFp8Config):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> QuantizationMethods | None:
-        if hf_quant_cfg is not None and hf_quant_cfg.get("quant_method") == "exl3":
+        if (
+            user_quant in (None, "exl3")
+            and hf_quant_cfg is not None
+            and hf_quant_cfg.get("quant_method") == "exl3"
+        ):
             return "exl3"
         return None
 
@@ -188,7 +192,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         from b12x.moe import fused_moe
-        from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_layer
+        from b12x.moe.checkpoints.exl3 import read_exl3_layer, trellis_from_exl3
 
         config = get_current_vllm_config()
         root = Path(config.model_config.model)
@@ -212,12 +216,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             slot_count=extent.slot_count,
         )
         device = layer.w13_weight.device
+        trellis_source, trellis_weights = trellis_from_exl3(source)
         plan = fused_moe.plan_weights(
-            source=fused_moe.Exl3Source(manifest=manifest),
+            source=trellis_source,
             activation=fused_moe.ActivationSpec(
                 mode="a16",
                 nonlinearity="situ",
                 io_dtype=torch.bfloat16,
+                rotation_dtype=torch.float16,
             ),
             geometry=fused_moe.MoEGeometry(
                 num_experts=geometry.num_experts,
@@ -227,7 +233,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         prepared = fused_moe.prepare_weights(
             plan=plan,
-            weights=fused_moe.Exl3Weights(layer=source, device=device),
+            weights=trellis_weights,
+            device=device,
         )
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         backend = B12xExperts(self.moe, self.moe_quant_config)
