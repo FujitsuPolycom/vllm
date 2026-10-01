@@ -59,7 +59,7 @@ def inspect_settings(environment, *, tp, batch, source):
                 (
                     "WARNING",
                     "HC_TOPOLOGY",
-                    "This HC sharding implementation requires TP4.",
+                    "This HC sharding implementation requires TP2 or TP4.",
                 )
             )
         if batch < 1024:

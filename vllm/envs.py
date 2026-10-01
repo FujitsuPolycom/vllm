@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
     VLLM_MXFP8_LM_HEAD: bool = False
+    VLLM_QWEN4_EXP_MXFP8_HC: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
@@ -1854,6 +1855,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Quantize eligible unquantized LM heads on b12x only when explicitly enabled.
     "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
+    # Quantize Qwen4Exp hyper-connection down/injection projections to MXFP8
+    # at load; they are otherwise BF16 and read in full on every rank.
+    "VLLM_QWEN4_EXP_MXFP8_HC": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_EXP_MXFP8_HC", "0"))
+    ),
     # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
     "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
     "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(

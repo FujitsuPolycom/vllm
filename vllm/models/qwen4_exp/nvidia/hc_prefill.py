@@ -28,7 +28,7 @@ def configure(model, config, mode: str) -> None:
     error = None
     parallel = config.parallel_config
     if mode != "off" and (
-        group.world_size != 4
+        group.world_size not in (2, 4)
         or parallel.pipeline_parallel_size != 1
         or parallel.data_parallel_size != 1
         or parallel.decode_context_parallel_size != 1
@@ -39,7 +39,7 @@ def configure(model, config, mode: str) -> None:
         or parallel.enable_dbo
         or config.model_config.dtype != torch.bfloat16
     ):
-        error = "Qwen HC ownership requires BF16 TP4/PP1/DP1/DCP1/PCP1"
+        error = "Qwen HC ownership requires BF16 TP2 or TP4/PP1/DP1/DCP1/PCP1"
     workspace = getattr(model, "hyper_connection_workspace", None)
     if mode == "shard" and getattr(workspace, "tp_size", 1) > 1:
         error = "Qwen HC row ownership cannot be combined with HC projection sharding"
@@ -53,7 +53,7 @@ def eligible(model, rows: int) -> bool:
     """Only real pure prefills with evenly owned rows bypass compiled decode."""
     if model.hc_prefill_mode == "off" or torch.compiler.is_compiling():
         return False
-    if rows < 1024 or rows % 4:
+    if rows < 1024 or rows % get_tp_group().world_size:
         return False
     if not is_forward_context_available() or torch.cuda.is_current_stream_capturing():
         return False
@@ -91,17 +91,18 @@ class RowOwnership:
     rows: int
     rank: int
     group: Any
+    size: int = 4
     reductions: int = 0
     gathers: int = 0
 
     def local(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.shape[0] != self.rows:
             raise ValueError("Qwen HC full tensor has the wrong row count")
-        count = self.rows // 4
+        count = self.rows // self.size
         return tensor.narrow(0, self.rank * count, count)
 
     def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.shape[0] != self.rows // 4:
+        if tensor.shape[0] != self.rows // self.size:
             raise ValueError("Qwen HC owned tensor has the wrong row count")
         self.gathers += 1
         source = tensor.contiguous()
@@ -114,7 +115,7 @@ class RowOwnership:
             raise ValueError("Qwen HC reduction requires full TP partial rows")
         self.reductions += 1
         source = tensor.contiguous()
-        output = source.new_empty((self.rows // 4, *source.shape[1:]))
+        output = source.new_empty((self.rows // self.size, *source.shape[1:]))
         self.group.reduce_scatter(output, source)
         return output
 
@@ -126,7 +127,7 @@ def create(model, rows: int) -> RowOwnership | None:
     comm = getattr(group.device_communicator, "pynccl_comm", None)
     if comm is None or not comm.available or comm.disabled:
         raise RuntimeError("Qwen HC ownership requires the TP NCCL communicator")
-    return RowOwnership(rows, group.rank_in_group, comm)
+    return RowOwnership(rows, group.rank_in_group, comm, group.world_size)
 
 
 def report(model, owner: RowOwnership | None, rows: int) -> None:
@@ -135,7 +136,7 @@ def report(model, owner: RowOwnership | None, rows: int) -> None:
             "QWEN_HC_PREFILL mode=%s rows=%d owner_rows=%d rs=%d ag=%d",
             model.hc_prefill_mode,
             rows,
-            rows if owner is None else rows // 4,
+            rows if owner is None else rows // owner.size,
             0 if owner is None else owner.reductions,
             0 if owner is None else owner.gathers,
         )

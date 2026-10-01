@@ -1303,3 +1303,13 @@ class OpenAIServingChat(GenerateBaseServing):
                 )
 
         return ChatCompletionLogProbs(content=logprobs_content)
+
+
+# SparkRing: with SPARKRING_TOOL_CHOICE_CONTRACT=1, a named or required
+# tool_choice without a complete declared call returns an error (HTTP 400 when
+# max_tokens ended generation, otherwise 500) instead of empty tool_calls.
+from vllm.entrypoints.openai.chat_completion import (  # noqa: E402
+    sparkring_tool_choice_contract,
+)
+
+sparkring_tool_choice_contract.install_from_environment(OpenAIServingChat)

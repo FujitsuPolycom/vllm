@@ -265,7 +265,7 @@ class MiMoVisionAttention(nn.Module):
             sliding_window_q=w,
             sliding_window_k=w,
             sinks=sinks,
-            sinks_bias_key0=True,
+            sinks_bias_key0=False,
         )
         return output
 

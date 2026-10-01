@@ -140,8 +140,10 @@ class SpinCondition:
             # Time of last shm buffer read
             self.last_read = time.monotonic()
 
-            # Time to keep busy-looping on the shm buffer before going idle
-            self.busy_loop_s = busy_loop_s
+            # Time to keep busy-looping on the shm buffer before going idle.
+            # SparkRing: SPARKRING_SHM_BUSY_LOOP_S, in seconds, replaces the
+            # constructor's value when set (FujitsuPolycom/sparkring#189).
+            self.busy_loop_s = float(os.environ.get("SPARKRING_SHM_BUSY_LOOP_S", busy_loop_s))
 
             # Readers subscribe to write notifications
             self.local_notify_socket: zmq.Socket = context.socket(SUB)

@@ -86,7 +86,11 @@ from .hyperconnection import (
     HyperConnectionConfig,
     HyperConnectionWorkspace,
 )
-from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+from .low_latency_gemm import (
+    applies_with_b12x,
+    enable_qwen4_exp_low_latency_gemm,
+    quantize_hyperconnection_mixing,
+)
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
@@ -760,7 +764,8 @@ class Qwen4ExpForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
-        if not uses_b12x(vllm_config):
+        quantize_hyperconnection_mixing(self)
+        if not uses_b12x(vllm_config) or applies_with_b12x():
             enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
 
     @staticmethod

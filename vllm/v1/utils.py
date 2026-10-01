@@ -140,7 +140,16 @@ class CpuGpuBuffer:
         cpu, gpu = self.cpu, self.gpu
         if n is not None:
             cpu, gpu = cpu[:n], gpu[:n]
-        return gpu.copy_(cpu.pin_memory() if PIN_MEMORY else cpu, non_blocking=True)
+        if not PIN_MEMORY:
+            return gpu.copy_(cpu, non_blocking=True)
+        # The host buffer is rewritten for the next step while this copy may
+        # still be queued (async scheduling keeps two batches in flight), and a
+        # non-blocking copy reads pinned memory when it executes. Snapshot the
+        # rows into fresh pinned staging; the caching host allocator keeps it
+        # until the copy completes.
+        staging = torch.empty_like(cpu, pin_memory=True)
+        staging.copy_(cpu)
+        return gpu.copy_(staging, non_blocking=True)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
