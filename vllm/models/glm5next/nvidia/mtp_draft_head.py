@@ -94,11 +94,13 @@ class QuantizedDraftHead(nn.Module):
         if self.shard_indices is None:
             raise TypeError("the shared target vocabulary head has no shard metadata")
 
+        # FlashInfer's CuTe-DSL BF16 x NVFP4 GEMM supports SM120 and SM121 with the
+        # same kernels; GB10 is SM121.
         major, minor = torch.cuda.get_device_capability(weight.device)
-        if (major, minor) != (12, 0):
+        if (major, minor) not in ((12, 0), (12, 1)):
             raise ValueError(
                 "the NVFP4 W4A16 draft vocabulary head requires CUDA capability "
-                f"12.0; got {major}.{minor}"
+                f"12.0 or 12.1; got {major}.{minor}"
             )
         import flashinfer
 
