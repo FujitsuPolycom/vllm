@@ -1687,6 +1687,8 @@ class OffloadingConnectorScheduler:
                         partial_segment_start_block // blocks_per_chunk
                     )
                     start_chunk_idx = min(start_chunk_idx, partial_segment_start_chunk)
+                # Transfer descriptors retain one slot per cache group, even
+                # when recurrent state is stored only by boundary handoffs.
                 group_store_ranges.append((start_chunk_idx, num_chunks))
 
                 if num_chunks <= start_chunk_idx:

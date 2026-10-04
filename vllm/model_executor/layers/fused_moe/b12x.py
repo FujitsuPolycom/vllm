@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """b12x modular tensor-parallel fused MoE backend."""
 
+import contextlib
 import functools
+import os
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -229,6 +231,64 @@ def _replace_parameter_with_empty(
     return getattr(layer, name)
 
 
+def _w4a16_a4_prefill_min_tokens() -> int:
+    return max(int(os.environ.get("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "0") or 0), 0)
+
+
+def _w4a16_a4_prefill_enabled() -> bool:
+    """b12x compiles the A4 prefill path when B12X_W4A16_A4_PREFILL_MIN_TOKENS
+    is set; it needs the activation global scales the A16 path otherwise
+    ignores."""
+    return _w4a16_a4_prefill_min_tokens() > 0
+
+
+_A4_SPLIT_LOGGED = False
+
+
+def _num_leading_decode_tokens(tokens: int) -> int:
+    """Leading decode-row count of the current decodes-first batch.
+
+    Requests with query length <= 4 (1 + 3 MTP tokens) count as decode rows;
+    KDA's reorder keeps them first. A GDN/KDA layer counts prefills on the
+    host, so a decode-only step needs no device read. Otherwise one host read
+    of query_start_loc per step, cached on the forward context. Never called
+    inside a captured CUDA graph. 0 without a forward context.
+    """
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return 0
+    context = get_forward_context()
+    cached = getattr(context, "_b12x_a4_decode_rows", None)
+    if cached is not None:
+        return cached
+    rows = 0
+    metadata = context.attn_metadata
+    if isinstance(metadata, dict):
+        prefills = [
+            value.num_prefills
+            for value in metadata.values()
+            if hasattr(value, "num_spec_decode_tokens")
+        ]
+        if prefills and not any(prefills):
+            rows = tokens
+        else:
+            for value in metadata.values():
+                starts = getattr(value, "query_start_loc", None)
+                if isinstance(starts, torch.Tensor) and hasattr(
+                    value, "num_actual_tokens"
+                ):
+                    bounds = starts.tolist()
+                    for lo, hi in zip(bounds, bounds[1:]):
+                        if not 0 < hi - lo <= 4:
+                            break
+                        rows = hi
+                    break
+    with contextlib.suppress(AttributeError):
+        context._b12x_a4_decode_rows = rows
+    return rows
+
+
 def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale.ndim == 2:
         if scale.shape[1] not in (1, 2):
@@ -423,6 +483,34 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 raise ValueError("b12x NVFP4 MoE requires activation global scales")
             a1_gscale = _normalize_expert_scale(self.a1_gscale).to(w1.device)
             a2_gscale = _normalize_expert_scale(self.a2_gscale).to(w2.device)
+        elif (
+            quant_mode == "w4a16"
+            and _w4a16_a4_prefill_enabled()
+            and self.a1_gscale is not None
+            and self.a2_gscale is not None
+        ):
+            # A4 prefill over the W4A16 weights quantizes each token once: share
+            # the widest calibrated input range (smallest global scale) across
+            # experts; the intermediate requant keeps per-expert scales.
+            a1 = _normalize_expert_scale(self.a1_gscale).to(w1.device)
+            a2 = _normalize_expert_scale(self.a2_gscale).to(w2.device)
+            if all(bool((torch.isfinite(t) & (t > 0)).all()) for t in (a1, a2)):
+                a1_gscale = a1.amin().reshape(1)
+                a2_gscale = a2
+                logger.info(
+                    "b12x W4A16: A4 prefill for calls >= %s tokens (shared input "
+                    "global scale %.4g, %d intermediate scales)",
+                    os.environ.get("B12X_W4A16_A4_PREFILL_MIN_TOKENS"),
+                    float(a1_gscale[0]),
+                    int(a2_gscale.numel()),
+                )
+            else:
+                # No calibrated activation scales (e.g. a draft layer): stay A16.
+                a1_gscale = a2_gscale = None
+                logger.warning(
+                    "b12x W4A16: layer has no valid activation scales; A4 prefill "
+                    "disabled for it (A16 only)"
+                )
         else:
             a1_gscale = unit_scale
             a2_gscale = unit_scale
@@ -481,7 +569,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         self.quant_config._w1.alpha_or_gscale = layer.w13_weight_scale_2
         self.quant_config._w2.alpha_or_gscale = layer.w2_weight_scale_2
-        if self._quant_mode in ("nvfp4", "w4a8_nvfp4"):
+        if self._quant_mode in ("nvfp4", "w4a8_nvfp4") or (
+            self._quant_mode == "w4a16"
+            and _w4a16_a4_prefill_enabled()
+            and getattr(layer, "w13_input_scale", None) is not None
+            and getattr(layer, "w2_input_scale", None) is not None
+        ):
             self.quant_config._a1.alpha_or_gscale = 1.0 / layer.w13_input_scale
             self.quant_config._a2.alpha_or_gscale = 1.0 / layer.w2_input_scale
 
@@ -534,28 +627,50 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     def install_prepared_experts(self, layer: torch.nn.Module, prepared: Any) -> None:
-        """Install EXL3 weights prepared through the common trellis API."""
+        """Install canonical prepared experts without retaining source parameters."""
         fused_moe = _require_b12x_fused_moe()
-        if (
-            self._source_format != "exl3"
-            or not isinstance(prepared, fused_moe.PreparedExperts)
-            or not isinstance(prepared.plan.source, fused_moe.TrellisSource)
-        ):
-            raise TypeError("EXL3 installation requires B12X prepared trellis weights")
+        if not isinstance(prepared, fused_moe.PreparedExperts):
+            raise TypeError("Installation requires B12X PreparedExperts")
+        trellis = self._source_format == "exl3" and isinstance(
+            prepared.plan.source, fused_moe.TrellisSource
+        )
+        packed = (
+            self._source_format == "fp4_e8m0_k32"
+            and isinstance(prepared.plan.source, fused_moe.PackedSource)
+            and prepared.plan.source.format == "fp4_e8m0_k32"
+        )
+        nvfp4 = (
+            self._source_format == "modelopt_nvfp4"
+            and self._quant_mode in ("nvfp4", "w4a16")
+            and isinstance(prepared.plan.source, fused_moe.PackedSource)
+            and prepared.plan.source.format == "modelopt_nvfp4"
+            and prepared.plan.source.w13_layout in (self._w13_layout, "w13")
+        )
+        if not (trellis or packed or nvfp4):
+            raise TypeError("Prepared expert encoding does not match the backend")
         if (
             prepared.num_experts != self.moe_config.num_experts
             or prepared.hidden_size != self.moe_config.hidden_dim
             or prepared.intermediate_size
             != self.moe_config.intermediate_size_per_partition
-            or prepared.plan.activation.mode != "a16"
-            or prepared.plan.activation.rotation_dtype != torch.float16
+            or prepared.plan.activation.mode
+            != (
+                "a4"
+                if nvfp4 and self._quant_mode == "nvfp4"
+                else "a8"
+                if packed and self._quant_mode == "w4a8_mx"
+                else "a16"
+            )
+            or (trellis and prepared.plan.activation.rotation_dtype != torch.float16)
             or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
             or prepared.plan.activation.nonlinearity
             != _b12x_activation_name(layer.activation)
+            or prepared.plan.activation.swiglu_limit != self.moe_config.swiglu_limit
             or layer.apply_router_weight_on_input
         ):
             raise ValueError(
-                "Prepared EXL3 geometry, activation or routing does not match the layer"
+                "Prepared expert geometry, activation or routing "
+                "does not match the layer"
             )
         self._apply_router_weight_on_input = False
         self._reuse_prepared_storage(layer, prepared)
@@ -942,6 +1057,47 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if workspace2 is None or not workspace2.is_contiguous():
             raise ValueError("b12x MoE requires contiguous caller-owned workspace2")
         scratch = workspace2.view(-1).view(torch.uint8)
+        tokens = int(hidden_states.shape[0])
+        if (
+            self._quant_mode == "w4a16"
+            and _w4a16_a4_prefill_enabled()
+            and getattr(getattr(prepared, "_impl", None), "a4_prefill_scales", False)
+        ):
+            # The row type decides the A4 prefill: decode rows always run
+            # W4A16 and prefill rows always A4, whatever the call size. A
+            # captured CUDA graph (decode steps and the smallest mixed steps)
+            # keeps W4A16 for all its rows. Layers without activation scales
+            # (the MTP draft layer) have no A4 path to choose.
+            if _is_current_stream_capturing():
+                parts = ((0, tokens, False),)
+            else:
+                decode_rows = min(_num_leading_decode_tokens(tokens), tokens)
+                parts = ((0, decode_rows, False), (decode_rows, tokens, True))
+                global _A4_SPLIT_LOGGED
+                if not _A4_SPLIT_LOGGED and 0 < decode_rows < tokens:
+                    _A4_SPLIT_LOGGED = True
+                    logger.info(
+                        "b12x W4A16 A4 prefill by row type: %d decode rows stay "
+                        "W4A16, %d prefill rows run A4",
+                        decode_rows,
+                        tokens - decode_rows,
+                    )
+            for lo, hi, a4_prefill in parts:
+                if hi == lo:
+                    continue
+                binding = _require_b12x_fused_moe().bind(
+                    plan,
+                    scratch=scratch,
+                    a=hidden_states[lo:hi],
+                    experts=prepared,
+                    topk_weights=topk_weights[lo:hi],
+                    topk_ids=topk_ids[lo:hi],
+                    output=output[lo:hi],
+                    input_scales_static=True,
+                    a4_prefill=a4_prefill,
+                )
+                _require_b12x_fused_moe().run(binding=binding)
+            return
         binding = _require_b12x_fused_moe().bind(
             plan,
             scratch=scratch,

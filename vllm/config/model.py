@@ -1278,12 +1278,15 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                "exl3",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",
                 "mxfp8",
                 "modelopt_mixed",
                 "exl3",
+                "mxfp4_csf",
+                "nvfp4_csf",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
                 "mxfp4",

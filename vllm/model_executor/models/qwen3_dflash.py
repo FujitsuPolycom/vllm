@@ -580,6 +580,7 @@ class DFlashQwen3Model(nn.Module):
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
+        aux_projection_tp_size = 1
         if self.use_aux_hidden_state:
             if (
                 envs.VLLM_DFLASH_AUX_MXFP8_STREAMING
@@ -590,14 +591,18 @@ class DFlashQwen3Model(nn.Module):
             # and all-gather the result: every output element keeps its full
             # dot product (bit-identical to a replicated layer) while each rank
             # streams 1/tp of the [hidden, num_aux * hidden] weight per step.
-            # A hidden width that TP does not divide is padded to whole
-            # 128-channel tiles; callers slice the gathered output back.
-            fc_tp_size = get_tensor_model_parallel_world_size()
-            tp_fc = fc_tp_size > 1
-            fc_cls = ColumnParallelLinear if tp_fc else ReplicatedLinear
+            # Widths that do not divide evenly are padded only on request.
+            tp_size = get_tensor_model_parallel_world_size()
+            fc_cls = ReplicatedLinear
+            fc_kwargs = {}
             fc_output_size = self.config.hidden_size
-            if tp_fc:
-                fc_output_size = _dflash_padded_width(fc_output_size, fc_tp_size)
+            if envs.VLLM_DFLASH_SHARD_AUX_PROJECTION or (
+                tp_size > 1 and fc_output_size % tp_size == 0
+            ):
+                fc_cls = ColumnParallelLinear
+                fc_kwargs["gather_output"] = True
+                fc_output_size = _dflash_padded_width(fc_output_size, tp_size)
+                aux_projection_tp_size = tp_size
             self.fc = fc_cls(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
@@ -608,7 +613,7 @@ class DFlashQwen3Model(nn.Module):
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
-                **({"gather_output": True} if tp_fc else {}),
+                **fc_kwargs,
             )
             if fc_output_size != self.config.hidden_size:
                 _enable_dflash_tp_padding(self.fc)
@@ -648,13 +653,7 @@ class DFlashQwen3Model(nn.Module):
                 # Preserve BF16 activations through the same W8A16 linear path
                 # used without staging; weight sharding does not quantize inputs.
                 method.kernel = MarlinMxfp8LinearKernel(Mxfp8LinearLayerConfig())
-        # Streamed auxiliary projections run on this rank's FC output shard and
-        # gather complete activations afterwards.
-        self._aux_projection_tp_size = (
-            get_tensor_model_parallel_world_size()
-            if isinstance(getattr(self, "fc", None), ColumnParallelLinear)
-            else 1
-        )
+        self._aux_projection_tp_size = aux_projection_tp_size
         self._streamed_aux_layer_ids = tuple(
             get_eagle3_aux_layers_from_config(vllm_config.speculative_config) or ()
         )

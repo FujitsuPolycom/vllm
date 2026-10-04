@@ -660,6 +660,31 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             ):
                 quant_config["quant_method"] = "mxfp4"
 
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        if model_config.quantization != "exl3":
+            return
+        text = model_config.hf_text_config
+        tp = parallel_config.tensor_parallel_size
+        if not 2 <= tp <= 24 or parallel_config.enable_expert_parallel:
+            raise ValueError(
+                "EXL3 experts require tensor parallel size 2..24 without EP"
+            )
+        original = getattr(
+            text, "original_num_attention_heads", text.num_attention_heads
+        )
+        text.original_num_attention_heads = original
+        text.num_attention_heads = round_up(original, tp)
+        if text.linear_attn_config is not None:
+            kda = dict(text.linear_attn_config)
+            original = kda.get("original_num_heads", kda["num_heads"])
+            kda["original_num_heads"] = original
+            kda["num_heads"] = round_up(original, tp)
+            text.linear_attn_config = kda
+        model_config.model_arch_config = model_config.get_model_arch_config()
+
 
 class Qwen3DSparkConfig(VerifyAndUpdateConfig):
     @staticmethod

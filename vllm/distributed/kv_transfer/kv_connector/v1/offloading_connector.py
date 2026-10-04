@@ -52,6 +52,11 @@ from vllm.v1.request import Request
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers):
     @classmethod
+    def supports_aligned_hybrid_transfer(cls, config: "VllmConfig") -> bool:
+        # Boundary captures and padded QSA page refs serve align-mode hits.
+        return True
+
+    @classmethod
     def supports_vmm_safe_transfer_config(
         cls, kv_transfer_config: KVTransferConfig
     ) -> bool:
@@ -59,11 +64,6 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         # storage implementations may retain GPU page registrations.
         extra = kv_transfer_config.kv_connector_extra_config or {}
         return extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
-
-    @classmethod
-    def supports_aligned_hybrid_transfer(cls, config: "VllmConfig") -> bool:
-        # Boundary captures and padded QSA page refs serve align-mode hits.
-        return True
 
     @cached_property
     def _bounding_group_ids(self) -> tuple[int, ...]:
